@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: WhoopKit tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: xcodebuild -version && swift --version
+      - name: swift test
+        working-directory: Packages/WhoopKit
+        run: swift test
+
+  ipa:
+    name: Unsigned IPA
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build for device (no signing)
+        run: |
+          xcodebuild -quiet \
+            -project MXWhoop.xcodeproj -scheme MXWhoop -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/MXWhoop.app Payload/
+          zip -qry MXWhoop-unsigned.ipa Payload
+          ls -lh MXWhoop-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MXWhoop-unsigned-ipa
+          path: MXWhoop-unsigned.ipa
+      - name: Attach to GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MXWhoop-unsigned.ipa
