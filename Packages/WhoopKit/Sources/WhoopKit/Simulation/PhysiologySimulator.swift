@@ -79,10 +79,13 @@ public struct PhysiologySimulator: Sendable {
         while nextBeat < end {
             let t = nextBeat
             let a = arousal(at: t)
-            let hr = restingHR + 14 * a + 2 * sin(2 * .pi * 0.03 * t)
-            let rsa = 45 * (1 - 0.6 * min(a, 1)) * sin(2 * .pi * breathingRate / 60 * t)
-            let mayer = 15 * sin(2 * .pi * 0.1 * t + 1)
-            let rr = Stats.clamp(60_000 / hr + rsa + mayer + 8 * rng.gaussian(), 350, 1800)
+            let drift: Double = 2 * sin(2 * Double.pi * 0.03 * t)
+            let hr: Double = restingHR + 14 * a + drift
+            let rsaAmplitude: Double = 45 * (1 - 0.6 * min(a, 1))
+            let rsa: Double = rsaAmplitude * sin(2 * Double.pi * breathingRate / 60 * t)
+            let mayer: Double = 15 * sin(2 * Double.pi * 0.1 * t + 1)
+            let jitter: Double = 8 * rng.gaussian()
+            let rr = Stats.clamp(60_000 / hr + rsa + mayer + jitter, 350, 1800)
             beats.append(TimedValue(t: t, v: rr))
             recentRR.append(rr)
             if recentRR.count > 4 { recentRR.removeFirst() }
@@ -97,15 +100,18 @@ public struct PhysiologySimulator: Sendable {
         for i in 0..<100 {
             let t = start + Double(i) / 100
             let a = arousal(at: t)
-            let tremorAmp = 0.002 + 0.006 * min(a, 1.5)
-            let speech = isSpeaking(at: t) ? 0.012 : 0
+            let tremorAmp: Double = 0.002 + 0.006 * min(a, 1.5)
+            let speaking = isSpeaking(at: t)
+            let noise: Double = speaking ? 0.0145 : 0.0025
+            let tremor: Double = tremorAmp * sin(2 * Double.pi * 9 * t)
             var v = gravity
-            v.x += Float(tremorAmp * sin(2 * .pi * 9 * t) + (0.0025 + speech) * rng.gaussian())
-            v.y += Float((0.0025 + speech) * rng.gaussian())
-            v.z += Float((0.0025 + speech) * rng.gaussian())
+            v.x += Float(tremor + noise * rng.gaussian())
+            v.y += Float(noise * rng.gaussian())
+            v.z += Float(noise * rng.gaussian())
             accel.append(v)
-            let g = 0.4 + (speech > 0 ? 3 : 0)
-            gyro.append(SIMD3(Float(g * rng.gaussian()), Float(g * rng.gaussian()), Float(g * rng.gaussian())))
+            let g: Double = speaking ? 3.4 : 0.4
+            let gx = Float(g * rng.gaussian()), gy = Float(g * rng.gaussian()), gz = Float(g * rng.gaussian())
+            gyro.append(SIMD3(gx, gy, gz))
         }
 
         // Pulse wave: amplitude shrinks with arousal (vasoconstriction).
@@ -115,8 +121,10 @@ public struct PhysiologySimulator: Sendable {
             let a = arousal(at: t)
             pulsePhase += Double(bpm) / 60 / 25
             let phase = pulsePhase.truncatingRemainder(dividingBy: 1)
-            let shape = exp(-pow((phase - 0.2) / 0.08, 2)) + 0.35 * exp(-pow((phase - 0.5) / 0.1, 2))
-            optical.append(120_000 + 2500 * (1 - 0.35 * min(a, 1.2)) * shape + 40 * rng.gaussian())
+            let systolic: Double = exp(-pow((phase - 0.2) / 0.08, 2))
+            let dicrotic: Double = 0.35 * exp(-pow((phase - 0.5) / 0.1, 2))
+            let amplitude: Double = 2500 * (1 - 0.35 * min(a, 1.2))
+            optical.append(120_000 + amplitude * (systolic + dicrotic) + 40 * rng.gaussian())
         }
         time = end
         return Second(start: start, bpm: bpm, beats: beats, accel: accel, gyro: gyro, optical: optical)

@@ -293,7 +293,9 @@ public struct LieModel: Codable, Equatable, Sendable {
             guard zt.count >= 2, zl.count >= 2, let mt = Stats.mean(zt), let ml = Stats.mean(zl) else { continue }
             // Pooled within-class variance, with κ pseudo-observations of the rest noise (σ = 1 in z units).
             let kappa = 2.0
-            let ss = zt.reduce(0) { $0 + ($1 - mt) * ($1 - mt) } + zl.reduce(0) { $0 + ($1 - ml) * ($1 - ml) }
+            let ssTruth: Double = zt.reduce(0) { $0 + ($1 - mt) * ($1 - mt) }
+            let ssLie: Double = zl.reduce(0) { $0 + ($1 - ml) * ($1 - ml) }
+            let ss = ssTruth + ssLie
             let s = max(((ss + kappa) / (Double(zt.count + zl.count - 2) + kappa)).squareRoot(), 0.5)
             let observed = Stats.clamp((ml - mt) / s, -3, 3)
             // Blend the personal effect size with the prior one.
