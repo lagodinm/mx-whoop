@@ -37,7 +37,7 @@ public enum WhoopParser {
         case .event, .puffinEvents:
             if end >= 16 { return .event(StrapEvent(number: b[10], strapTime: b.u32(at: 12))) }
         case .consoleLogs:
-            return .consoleLog(printableASCII(b[9..<end]))
+            if let c = console(b, end: end) { return .consoleLog(c) }
         case .metadata, .puffinMetadata:
             if end >= 11 { return .metadata(packetType: type, kind: b[10]) }
         default:
@@ -150,7 +150,23 @@ public enum WhoopParser {
             steps: b.u16(at: 57),
             activity: BiometricRecord.Activity(rawValue: b[63]),
             bandState: BiometricRecord.BandState(rawValue: (b[81] >> 4) & 3) ?? .wake,
-            qualityFlags: b[36])
+            qualityFlags: b[36],
+            extras: BiometricRecord.Extras(alternateHR: b[37], cadenceRaw: b[59], stateBits: b[81],
+                                           spo2CandidateRaw: b[82], opticalBaseline: [b[106], b[107]],
+                                           opticalAmplitude: [b[108], b[109]]))
+    }
+
+    // MARK: Packet 50 — firmware console
+
+    /// `[9] sequence · [12] u32 strap time · [18] u16 text length · [21…] text`, checked
+    /// against a real capture. Lines continue across frames; reassemble by concatenation.
+    static func console(_ b: [UInt8], end: Int) -> ConsoleFragment? {
+        guard end > 21 else { return nil }
+        let declared = Int(b.u16(at: 18))
+        let stop = declared > 0 ? min(end, 21 + declared) : end
+        // Each fragment ends in a NUL that is not part of the text.
+        let text = printableASCII(b[21..<stop].prefix { $0 != 0 }, trimming: false)
+        return ConsoleFragment(sequence: b[9], strapTime: b.u32(at: 12), text: text)
     }
 
     // MARK: Layouts 16/17 — MG ECG
@@ -178,7 +194,8 @@ public enum WhoopParser {
                 samples.append(raw >= 131_072 ? raw - 262_144 : raw)
             }
         }
-        return ECGRecord(layout: layout, isLive: live, sequence: b.u32(at: 11), quality: b[21],
+        return ECGRecord(layout: layout, isLive: live, sequence: b.u32(at: 11), timestampMain: b.u32(at: 15),
+                         timestampExtra: b.u16(at: 19), quality: b[21],
                          statusBits: b[22], classifierResult: b[23], classifierState: b[24],
                          progress: b[25], strapHRValue: b[27], samples: samples)
     }
@@ -218,8 +235,53 @@ public enum WhoopParser {
         return (0...100).contains(v) ? v : nil
     }
 
-    static func printableASCII(_ bytes: ArraySlice<UInt8>) -> String {
-        String(decoding: bytes.map { (0x20...0x7E).contains($0) || $0 == 0x0A ? $0 : 0x20 }, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    /// GET_DEVICE_CONFIG_VALUE (121) / GET_FF_VALUE (128): `[0] rev · [1…32] key · [33…64] value`, NUL-terminated.
+    public static func configValue(_ r: CommandResponse) -> ConfigValue? {
+        let isFlag = r.command == WhoopCommand.getFeatureFlagValue.rawValue
+        guard isFlag || r.command == WhoopCommand.getDeviceConfigValue.rawValue,
+              r.result == .success, r.body.count >= 65 else { return nil }
+        func field(_ range: Range<Int>) -> String {
+            let bytes = r.body[range].prefix { $0 != 0 }
+            return printableASCII(bytes)
+        }
+        let key = field(1..<33)
+        guard !key.isEmpty else { return nil }
+        return ConfigValue(key: key, value: field(33..<65), isFeatureFlag: isFlag)
+    }
+
+    /// GET_ALARM_TIME (67) revision 4: `[1] id · [2] u32 seconds · [18] repeats · [19] duration · [20] crescendo`.
+    public static func alarm(_ r: CommandResponse) -> AlarmSlot? {
+        guard r.command == WhoopCommand.getAlarmTime.rawValue, r.result == .success,
+              r.body.count >= 21, r.body[0] == 4 else { return nil }
+        let t = r.body.u32(at: 2)
+        return AlarmSlot(id: r.body[1], time: t > 1_577_836_800 ? t : nil, repeats: r.body[18],
+                         duration: r.body[19], crescendo: r.body[20] == 1)
+    }
+
+    /// GET_BATTERY_PACK_INFO (151): `[0] rev · [1] presence · [24] u16 charge`. The identifier
+    /// and serial blocks (2–23) are deliberately not read.
+    public static func batteryPack(_ r: CommandResponse) -> BatteryPackInfo? {
+        guard r.command == WhoopCommand.getBatteryPackInfo.rawValue, r.result == .success,
+              r.body.count >= 26, r.body[0] == 1 else { return nil }
+        return BatteryPackInfo(present: r.body[1] != 0, chargeRaw: r.body.u16(at: 24))
+    }
+
+    /// GET_CLOCK (147): `[0] rev · [1] u32 seconds · [5] u16 ticks (1/32768 s)`. Zero means no valid time.
+    public static func clock(_ r: CommandResponse) -> Double? {
+        guard r.command == WhoopCommand.getClock.rawValue, r.result == .success, r.body.count >= 7 else { return nil }
+        let seconds = r.body.u32(at: 1)
+        guard seconds > 1_577_836_800 else { return nil }
+        return Double(seconds) + Double(r.body.u16(at: 5)) / 32768
+    }
+
+    /// GET_GYRO_MODE (152): `[0] rev · [1] mode`.
+    public static func gyroMode(_ r: CommandResponse) -> UInt8? {
+        guard r.command == WhoopCommand.getGyroMode.rawValue, r.result == .success, r.body.count >= 2 else { return nil }
+        return r.body[1]
+    }
+
+    static func printableASCII<C: Collection>(_ bytes: C, trimming: Bool = true) -> String where C.Element == UInt8 {
+        let s = String(decoding: bytes.map { (0x20...0x7E).contains($0) || $0 == 0x0A ? $0 : 0x20 }, as: UTF8.self)
+        return trimming ? s.trimmingCharacters(in: .whitespacesAndNewlines) : s
     }
 }

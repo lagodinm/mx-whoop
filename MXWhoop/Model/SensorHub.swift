@@ -75,6 +75,26 @@ final class SensorHub {
     let biometrics = BiometricsMonitor()
     /// Experimental live ECG (WHOOP MG).
     let ecg = ECGSession()
+    /// Read-only settings, alarms, battery pack, clock.
+    let internals = StrapInternals()
+
+    // The official app, seen from here: the strap's replies to *its* commands reach every
+    // subscribed app, so we can tell when it syncs, acknowledges or uses a sensor.
+    struct ForeignCommand: Identifiable {
+        let id: Int
+        let date: Date
+        let name: String
+        let result: String
+    }
+    private(set) var foreignLog: [ForeignCommand] = []
+    private(set) var foreignCounts: [String: Int] = [:]
+    private(set) var whoopAppLastSeen: Date?
+    /// The WHOOP app holds a sensor session (raw, IMU/optical saving or ECG companion) that a
+    /// STOP_RAW_DATA from us would clear.
+    private(set) var whoopAppUsesSensors = false
+    /// Reassembled firmware console lines, oldest first.
+    private(set) var consoleLines: [String] = []
+    var whoopAppPresent: Bool { whoopAppLastSeen != nil || biometrics.syncByOthersSeen }
 
     // Streams & settings
     private(set) var imuEnabled = false
@@ -107,6 +127,9 @@ final class SensorHub {
     @ObservationIgnored private var accelCounter = 0
     @ObservationIgnored private var tickCount = 0
     @ObservationIgnored private var sessionTrimp = 0.0
+    @ObservationIgnored private var sentCommands: [(command: UInt8, seq: UInt8, at: Double)] = []
+    @ObservationIgnored private var foreignCounter = 0
+    @ObservationIgnored private var consolePartial = ""
 
     static let timelineSpan: Double = 15 * 60
     static let rawLogLimit = 400
@@ -120,6 +143,7 @@ final class SensorHub {
         ecg.send = { [weak self] in self?.send($0) }
         ecg.log = { [weak self] in self?.addLog($0) }
         ecg.recorder = recorder
+        internals.send = { [weak self] in self?.send($0) }
     }
 
     private static func loadProfile() -> EffortProfile {
@@ -156,10 +180,15 @@ final class SensorHub {
         if linkState == .streaming {
             ecg.stop()
             biometrics.willDisconnect()
-            if imuEnabled || opticalEnabled { send(CommandBody.rawData(false)) }
+            if imuEnabled || opticalEnabled { stopRawCollectionIfOurs() }
             if imuEnabled { send(CommandBody.imuStream(false)) }
             if opticalEnabled { send(CommandBody.opticalStream(false)) }
-            send(CommandBody.realtimeHR(false))
+            // Live HR is one switch shared by every app; leave it for the WHOOP app if it's around.
+            if whoopAppPresent {
+                addLog("Leaving live HR on: the WHOOP app is connected too")
+            } else {
+                send(CommandBody.realtimeHR(false))
+            }
         }
         let current = link
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { current?.disconnect() }
@@ -176,6 +205,9 @@ final class SensorHub {
         timeline = PhysioTimeline()
         resetEffort()
         biometrics.reset()
+        internals.reset()
+        foreignLog = []; foreignCounts = [:]; whoopAppLastSeen = nil; whoopAppUsesSensors = false
+        sentCommands = []; consoleLines = []; consolePartial = ""
         newLink.onEvent = { [weak self] event in self?.handle(event) }
     }
 
@@ -194,9 +226,21 @@ final class SensorHub {
         if on {
             send(CommandBody.rawData(true)); send(CommandBody.imuStream(true))
         } else {
-            if !opticalEnabled { send(CommandBody.rawData(false)) }
+            if !opticalEnabled { stopRawCollectionIfOurs() }
             send(CommandBody.imuStream(false))
             motion = nil; accelPreview = []
+        }
+    }
+
+    /// STOP_RAW_DATA clears *every* app's raw and per-sensor session requests on the strap
+    /// (noop: "a later raw stop can clear collection requested earlier by another session
+    /// control"). If the WHOOP app is using a sensor session (e.g. Strength Trainer), leave
+    /// it running; our own request then just expires.
+    private func stopRawCollectionIfOurs() {
+        if whoopAppUsesSensors {
+            addLog("Not sending STOP_RAW_DATA: the WHOOP app is using a sensor session")
+        } else {
+            send(CommandBody.rawData(false))
         }
     }
 
@@ -208,7 +252,7 @@ final class SensorHub {
         if on {
             send(CommandBody.rawData(true)); send(CommandBody.opticalStream(true))
         } else {
-            if !imuEnabled { send(CommandBody.rawData(false)) }
+            if !imuEnabled { stopRawCollectionIfOurs() }
             send(CommandBody.opticalStream(false))
             opticalPreview = []
         }
@@ -246,6 +290,8 @@ final class SensorHub {
         case .peripheral(let name):
             deviceName = name
         case .commandSent(let label, let seq, let frame):
+            sentCommands.append((frame.bytes[10], seq, now))
+            if sentCommands.count > 96 { sentCommands.removeFirst(sentCommands.count - 96) }
             addRaw(channel: "→", title: label, summary: "seq \(seq) · \(frame.count) B", bytes: frame.bytes,
                    kind: .command, outgoing: true, isError: false)
             recorder.log(frame: frame, channel: "TX")
@@ -291,8 +337,13 @@ final class SensorHub {
                 if hello.batteryPercent > 0 { battery = Int(hello.batteryPercent.rounded()) }
             }
             if let b = WhoopParser.batteryPercent(r) { battery = b }
-            biometrics.handleResponse(r)
-            ecg.handle(r)
+            let ours = isOurs(r)
+            if !ours { noteForeign(r) }
+            biometrics.handleResponse(r, ours: ours)
+            internals.handle(r, ours: ours)
+            if ours { ecg.handle(r) }
+        case .consoleLog(let fragment):
+            ingestConsole(fragment)
         case .event(let e):
             lastEvent = e
             if e.number == StrapEvent.wristOn { onWrist = true }
@@ -303,7 +354,7 @@ final class SensorHub {
             if type == PacketType.metadata.rawValue || type == PacketType.puffinMetadata.rawValue {
                 biometrics.handleMarker(kind)
             }
-        case .consoleLog, .other:
+        case .other:
             break
         }
         addRaw(channel: channel.rawValue, title: title, summary: summary, bytes: f.bytes,
@@ -378,7 +429,9 @@ final class SensorHub {
         }
         arousal = LieDetector.liveArousal(timeline, now: t, noise: noiseProfile)
         updateEffort(t)
+        biometrics.whoopAppLastSeen = whoopAppLastSeen
         biometrics.tick()
+        ecg.ppgHeartRate = hasLiveHeartRate ? heartRate.map { Double($0) } : nil
         ecg.tick()
         if heartRate != nil, t - lastHRAt > 5 { heartRate = nil }
         // Live HR stopped (e.g. the WHOOP app turned it off): re-arm, at most every 10 s.
@@ -387,6 +440,51 @@ final class SensorHub {
             addLog("No live HR for 10 s — re-arming TOGGLE_REALTIME_HR")
             send(CommandBody.realtimeHR(true))
         }
+    }
+
+    // MARK: The WHOOP app, observed
+
+    /// A response answers our command when we sent that command number with that sequence
+    /// number recently. Anything else answers another app on the same link.
+    private func isOurs(_ r: CommandResponse) -> Bool {
+        let t = now
+        sentCommands.removeAll { t - $0.at > 30 }
+        return sentCommands.contains { $0.command == r.command && $0.seq == r.originSeq }
+    }
+
+    private func noteForeign(_ r: CommandResponse) {
+        guard r.result != .pending else { return }
+        whoopAppLastSeen = Date()
+        let name = r.commandName
+        foreignCounts[name, default: 0] += 1
+        foreignCounter += 1
+        let result = r.result.map { "\($0)" } ?? "result \(r.resultRaw)"
+        foreignLog.insert(ForeignCommand(id: foreignCounter, date: Date(), name: name, result: result), at: 0)
+        if foreignLog.count > 150 { foreignLog.removeLast() }
+        // Sensor sessions that a STOP_RAW_DATA from us would clear.
+        switch WhoopCommandNumber(rawValue: r.command) {
+        case .startRaw, .imuSaving, .opticalSaving, .ecgGeneration:
+            if r.result == .success { whoopAppUsesSensors = true }
+        case .stopRaw:
+            whoopAppUsesSensors = false
+        case nil:
+            break
+        }
+    }
+
+    private enum WhoopCommandNumber: UInt8 {
+        case startRaw = 81, stopRaw = 82, imuSaving = 105, opticalSaving = 107, ecgGeneration = 124
+    }
+
+    private func ingestConsole(_ c: ConsoleFragment) {
+        consolePartial += c.text
+        var parts = consolePartial.components(separatedBy: "\n")
+        consolePartial = parts.removeLast()
+        if consolePartial.count > 600 { parts.append(consolePartial); consolePartial = "" }
+        let lines = parts.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return }
+        consoleLines += lines
+        if consoleLines.count > 400 { consoleLines.removeFirst(consoleLines.count - 400) }
     }
 
     // MARK: Effort
@@ -460,8 +558,8 @@ final class SensorHub {
             return ("RESPONSE", "\(r.commandName) #\(r.originSeq) · \(result) · \(r.body.count) B", .command)
         case .event(let e):
             return ("EVENT", e.name, .event)
-        case .consoleLog(let text):
-            return ("CONSOLE", String(text.prefix(120)), .other)
+        case .consoleLog(let c):
+            return ("CONSOLE", "#\(c.sequence) " + String(c.text.prefix(120)), .other)
         case .metadata(_, let kind):
             let marker = HistoryMarker(rawValue: kind).map { "HISTORY_\("\($0)".uppercased())" } ?? "kind \(kind)"
             return ("METADATA", "\(typeName) \(marker)", .body)

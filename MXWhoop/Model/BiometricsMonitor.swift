@@ -47,10 +47,17 @@ final class BiometricsMonitor {
     private(set) var stepsSeen: Int?
     private(set) var recordsSeen = 0
     private(set) var lastSyncTraffic: Date?
+    /// A history sync this app didn't start (the WHOOP app's) has been seen this session.
+    private(set) var syncByOthersSeen = false
     private(set) var dataRange: DataRange?
     private(set) var dataRangeAt: Date?
     private(set) var fastSync: FastSync = .off
     private(set) var peek: Peek = .idle
+    /// Last 24 h of archived summaries, one point per minute.
+    private(set) var dayBins: [MinuteBin] = []
+    /// Set by the hub whenever a response to another app's command is seen.
+    var whoopAppLastSeen: Date?
+    let archive = StrapArchive()
 
     var fastSyncWanted: Bool {
         didSet {
@@ -73,6 +80,10 @@ final class BiometricsMonitor {
     @ObservationIgnored private var firstSteps: UInt16?
     @ObservationIgnored private var lastSteps: UInt16?
     @ObservationIgnored private var stepTotal = 0
+    /// Another app (the WHOOP app) asked for high-frequency sync too: never end it.
+    @ObservationIgnored private var foreignFastSync = false
+    @ObservationIgnored private var binsDirty = false
+    @ObservationIgnored private var lastBinRebuild: Date = .distantPast
 
     private static let fastSyncKey = "fastSyncWanted"
     static let fastSyncInterval = 61
@@ -82,6 +93,7 @@ final class BiometricsMonitor {
 
     init() {
         fastSyncWanted = UserDefaults.standard.object(forKey: Self.fastSyncKey) as? Bool ?? true
+        archive.load { [weak self] in self?.rebuildBins() }
     }
 
     // MARK: Lifecycle (called by SensorHub)
@@ -89,9 +101,15 @@ final class BiometricsMonitor {
     func reset() {
         skinTemp = nil; auxTemps = (nil, nil); series = []; latest = nil
         stepsSeen = nil; recordsSeen = 0; lastSyncTraffic = nil; dataRange = nil; dataRangeAt = nil
-        fastSync = .off; peek = .idle
+        fastSync = .off; peek = .idle; whoopAppLastSeen = nil; syncByOthersSeen = false
         seenIndices.removeAll(); firstSteps = nil; lastSteps = nil; stepTotal = 0
-        streaming = false; enterSentAt = nil; peekStartedAt = nil
+        streaming = false; enterSentAt = nil; peekStartedAt = nil; foreignFastSync = false
+    }
+
+    func rebuildBins() {
+        dayBins = archive.recentBins()
+        binsDirty = false
+        lastBinRebuild = Date()
     }
 
     func sessionStarted() {
@@ -134,6 +152,7 @@ final class BiometricsMonitor {
         if peek == .reading, let started = peekStartedAt, now.timeIntervalSince(started) > 12 {
             finishPeek()
         }
+        if binsDirty, now.timeIntervalSince(lastBinRebuild) > 5 { rebuildBins() }
     }
 
     // MARK: Frames
@@ -144,6 +163,8 @@ final class BiometricsMonitor {
         guard seenIndices.insert(r.recordIndex).inserted else { return }
         if seenIndices.count > 50_000 { seenIndices.removeAll() }
         recordsSeen += 1
+        archive.append(r)
+        binsDirty = true
 
         let measured = Date(timeIntervalSince1970: TimeInterval(r.unixTime))
         let source: Source = peek == .reading ? .memory : .sync
@@ -165,6 +186,7 @@ final class BiometricsMonitor {
 
     func handleMarker(_ kind: UInt8) {
         lastSyncTraffic = Date()
+        if peek != .reading { syncByOthersSeen = true }
         guard let marker = HistoryMarker(rawValue: kind) else { return }
         if peek == .reading, marker == .end || marker == .complete {
             finishPeek()
@@ -189,10 +211,20 @@ final class BiometricsMonitor {
         }
     }
 
-    func handleResponse(_ r: CommandResponse) {
+    /// `ours`: the response answers a command this app sent (otherwise the WHOOP app's).
+    func handleResponse(_ r: CommandResponse, ours: Bool) {
         if let range = WhoopParser.dataRange(r) {
             dataRange = range
             dataRangeAt = Date()
+        }
+        if !ours {
+            if r.command == WhoopCommand.enterHighFreqSync.rawValue, r.result == .success {
+                foreignFastSync = true
+                fastSync = .on(ours: false)
+            } else if r.command == WhoopCommand.exitHighFreqSync.rawValue {
+                foreignFastSync = false
+            }
+            return
         }
         if r.command == WhoopCommand.enterHighFreqSync.rawValue, let result = r.result {
             switch result {
@@ -215,8 +247,12 @@ final class BiometricsMonitor {
     func readStrapMemory() {
         guard streaming else { peek = .unavailable("Connect the strap first."); return }
         guard peek != .reading else { return }
-        if let last = lastSyncTraffic, Date().timeIntervalSince(last) < 20 {
-            peek = .unavailable("The WHOOP app is syncing right now; its records are already arriving here.")
+        // Only when the WHOOP app is not around: while it syncs, its records arrive here
+        // anyway, and a parallel history request could interrupt its sync (it would retry).
+        let recentSync = lastSyncTraffic.map { Date().timeIntervalSince($0) < 300 } ?? false
+        let recentApp = whoopAppLastSeen.map { Date().timeIntervalSince($0) < 120 } ?? false
+        if recentSync || recentApp {
+            peek = .unavailable("Not needed: the WHOOP app is active and its syncs already bring the records here. Reading memory directly is only allowed when the WHOOP app has been quiet for 5 minutes, so it never interrupts its sync.")
             return
         }
         peek = .reading
@@ -249,7 +285,7 @@ final class BiometricsMonitor {
 
     /// Ends only a session we started, never one the WHOOP app is running for itself.
     private func stopFastSync() {
-        if case .on(ours: true) = fastSync, streaming {
+        if case .on(ours: true) = fastSync, streaming, !foreignFastSync {
             send?(CommandBody.exitHighFreqSync)
         }
         if fastSync != .refused { fastSync = .off }

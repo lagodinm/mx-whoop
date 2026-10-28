@@ -27,6 +27,8 @@ final class DemoStrap: StrapLink {
     private var steps: UInt16 = 4_210
     private var highFreqSync = false
     private var nextPrompt = Date.distantFuture
+    private var foreignSequence: UInt8 = 200
+    private var consoleSequence: UInt8 = 0
 
     // ECG
     private var ecgLive = false
@@ -112,6 +114,17 @@ final class DemoStrap: StrapLink {
             let start = request.params.count >= 2 && request.params[1] >= 2
             if start && !ecgGenerating { ecgStartedAt = Date() }
             ecgGenerating = start
+        case .getDeviceConfigValue, .getFeatureFlagValue:
+            body = configReply(request.params)
+        case .getAlarmTime:
+            body = alarmReply(slot: request.params.count > 1 ? request.params[1] : 0)
+        case .getBatteryPackInfo:
+            body = [0x01, 0x01] + [UInt8](repeating: 0, count: 22) + UInt16(734).littleEndianBytesForDemo + [0, 0]
+        case .getClock:
+            let t = Date().timeIntervalSince1970 + 0.3
+            body = [0x01] + UInt32(t).littleEndianBytesForDemo + UInt16((t - floor(t)) * 32768).littleEndianBytesForDemo
+        case .getGyroMode:
+            body = [0x01, 0x01]
         default:
             break
         }
@@ -188,12 +201,60 @@ final class DemoStrap: StrapLink {
     private func whoopAppSync() {
         guard !unsynced.isEmpty else { return }
         let now = UInt32(Date().timeIntervalSince1970)
+        let chunks = pages(unsynced.count)
+        // The strap's replies to the WHOOP app's own commands, which every subscribed app sees.
+        foreignReply(WhoopCommand.getDataRange.rawValue, body: dataRangeBody())
+        foreignReply(WhoopCommand.sendHistoricalData.rawValue, body: [0x0B, 0, 0])
         deliver(SyntheticFrames.historyMarker(.start, time: now), .data)
         for item in unsynced { deliver(item.frame, .data) }
-        trimPage &+= pages(unsynced.count)
+        trimPage &+= chunks
         deliver(SyntheticFrames.historyMarker(.end, time: now, trimCursor: trimPage), .data)
+        for _ in 0..<chunks { foreignReply(23, body: [0, 0, 0]) } // HISTORICAL_DATA_RESULT, sent by the WHOOP app
         deliver(SyntheticFrames.historyMarker(.complete, time: now), .data)
+        console("BLE_CMD: Command Send Historical Data\n  7, \(Int(now) % 1_000_000): BLE: History burst success. Trim: \(trimPage)\n  7, \(Int(now) % 1_000_000): BLE: Historical Dump Complete\n  7, \(Int(now) % 1_000_000): SENSORS: No active optical data collection sources. Backlog: 0.0\n")
         unsynced.removeAll()
+    }
+
+    private func foreignReply(_ command: UInt8, body: [UInt8]) {
+        foreignSequence = foreignSequence >= 250 ? 200 : foreignSequence + 1
+        deliver(SyntheticFrames.commandResponse(command: command, originSeq: foreignSequence, result: .success, body: body), .command)
+    }
+
+    /// Splits text into frame-sized fragments, as the firmware does.
+    private func console(_ text: String) {
+        let now = UInt32(Date().timeIntervalSince1970)
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            consoleSequence &+= 1
+            deliver(SyntheticFrames.console(sequence: consoleSequence, time: now, text: String(rest.prefix(48))), .data)
+            rest = rest.dropFirst(48)
+        }
+    }
+
+    private func configReply(_ params: [UInt8]) -> [UInt8] {
+        let key = String(decoding: params.dropFirst().prefix { $0 != 0 }, as: UTF8.self)
+        let values: [String: String] = [
+            "cont_collection_mode": "0", "max_collection_backlog": "80.0", "enable_raw_data_w_ecg": "1",
+            "dorset_detection_period_min": "0", "enable_r22_packets": "1", "enable_r22_v4_packets": "1",
+            "disable_pip_r26_packets": "2", "hr_ch_switching": "2", "whoop_live_hr_in_adv_ind_pkt": "2",
+        ]
+        var body = [UInt8](repeating: 0, count: 65)
+        body[0] = 1
+        for (i, b) in key.utf8.prefix(31).enumerated() { body[1 + i] = b }
+        for (i, b) in (values[key] ?? "2").utf8.enumerated() { body[33 + i] = b }
+        return body
+    }
+
+    private func alarmReply(slot: UInt8) -> [UInt8] {
+        var body = [UInt8](repeating: 0, count: 21)
+        body[0] = 4; body[1] = slot
+        if slot == 1 {
+            let tomorrow7 = Calendar.current.nextDate(after: Date(), matching: DateComponents(hour: 7, minute: 0),
+                                                      matchingPolicy: .nextTime) ?? Date()
+            body.replaceSubrange(2..<6, with: UInt32(tomorrow7.timeIntervalSince1970).littleEndianBytesForDemo)
+            body[18] = 3; body[19] = 30
+        }
+        return body
     }
 
     /// SEND_HISTORICAL_DATA without an acknowledgement: the first chunk, then END; nothing is released.
@@ -258,5 +319,9 @@ final class DemoStrap: StrapLink {
 }
 
 private extension UInt32 {
+    var littleEndianBytesForDemo: [UInt8] { withUnsafeBytes(of: littleEndian, Array.init) }
+}
+
+private extension UInt16 {
     var littleEndianBytesForDemo: [UInt8] { withUnsafeBytes(of: littleEndian, Array.init) }
 }

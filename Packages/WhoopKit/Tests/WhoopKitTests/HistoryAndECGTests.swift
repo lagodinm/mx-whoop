@@ -20,6 +20,50 @@ final class CapturedHistoryTests: XCTestCase {
         XCTAssertEqual(r.bandState, .wake)
         let g = try XCTUnwrap(r.gravity)
         XCTAssertEqual(Double((g * g).sum().squareRoot()), 1.0, accuracy: 0.02)
+        XCTAssertEqual(r.extras.alternateHR, 62)
+        XCTAssertEqual(r.extras.spo2CandidateRaw, 0)
+        XCTAssertEqual(r.extras.opticalBaseline, [151, 161])
+        XCTAssertEqual(r.extras.opticalAmplitude, [37, 38])
+    }
+
+    func testConsoleTextReassemblesFromRealStrap() throws {
+        let a = try XCTUnwrap(WhoopFrame(validating: [UInt8](hex: "aa014400010030b132e202000c45c969ae4734000120636f6e666967206b65792c20696e64657820303a2067656e6572616c5f61625f746573740a2020372c203835333331343100ca10c618")!))
+        let b = try XCTUnwrap(WhoopFrame(validating: [UInt8](hex: "aa014400010030b132e302000c45c969ae4734000133303a20424c455f434d443a2053656e642070657273697374656e7420636f6e666967206b65792c20696e64657820313a20006fc657a9")!))
+        guard case .consoleLog(let first) = WhoopParser.parse(a), case .consoleLog(let second) = WhoopParser.parse(b)
+        else { return XCTFail() }
+        XCTAssertEqual(first.sequence &+ 1, second.sequence)
+        XCTAssertEqual(first.strapTime, 1_774_798_092)
+        // The tick counter "853314130" is split across the two frames.
+        XCTAssertEqual(first.text + second.text,
+                       " config key, index 0: general_ab_test\n  7, 853314130: BLE_CMD: Send persistent config key, index 1: ")
+    }
+
+    func testReadOnlyInternalsReplies() throws {
+        var body = [UInt8](repeating: 0, count: 65)
+        body[0] = 1
+        body.replaceSubrange(1..<(1 + 20), with: Array("cont_collection_mode".utf8))
+        body[33] = UInt8(ascii: "1")
+        let cfg = SyntheticFrames.commandResponse(command: 121, originSeq: 1, result: .success, body: body)
+        guard case .commandResponse(let r) = WhoopParser.parse(cfg) else { return XCTFail() }
+        XCTAssertEqual(WhoopParser.configValue(r), ConfigValue(key: "cont_collection_mode", value: "1", isFeatureFlag: false))
+
+        var alarm = [UInt8](repeating: 0, count: 21)
+        alarm[0] = 4; alarm[1] = 2
+        alarm.replaceSubrange(2..<6, with: UInt32(1_800_000_000).littleEndianBytes)
+        alarm[18] = 3; alarm[19] = 60; alarm[20] = 1
+        guard case .commandResponse(let ar) = WhoopParser.parse(SyntheticFrames.commandResponse(command: 67, originSeq: 2, result: .success, body: alarm))
+        else { return XCTFail() }
+        XCTAssertEqual(WhoopParser.alarm(ar), AlarmSlot(id: 2, time: 1_800_000_000, repeats: 3, duration: 60, crescendo: true))
+
+        let clockBody: [UInt8] = [1] + UInt32(1_774_798_100).littleEndianBytes + UInt16(16384).littleEndianBytes
+        guard case .commandResponse(let cr) = WhoopParser.parse(SyntheticFrames.commandResponse(command: 147, originSeq: 3, result: .success, body: clockBody))
+        else { return XCTFail() }
+        XCTAssertEqual(try XCTUnwrap(WhoopParser.clock(cr)), 1_774_798_100.5, accuracy: 1e-6)
+
+        XCTAssertEqual(CommandBody.readConfig("enable_rfid", featureFlag: true).params.count, 33)
+        XCTAssertEqual(CommandBody.readConfig("enable_rfid", featureFlag: true).command, 128)
+        XCTAssertEqual(CommandBody.alarm(slot: 3).params, [4, 3])
+        XCTAssertEqual(CommandNames.name(23), "HISTORICAL_DATA_RESULT")
     }
 
     func testDataRangeFromRealStrap() throws {
@@ -184,27 +228,68 @@ final class NewAnalysisTests: XCTestCase {
         XCTAssertNil(HRV.stressIndex(Array(calm.prefix(10))))
     }
 
-    func testECGPeaksAtAnyPolarityAndRate() {
-        for (fs, bpm, inverted) in [(100.0, 60.0, false), (100.0, 150.0, true), (128.0, 45.0, true), (250.0, 72.0, false)] {
-            var beats: [Double] = []
-            var t = 0.37
-            var k = 0.0
-            while t < 12 {
-                beats.append(t)
-                t += 60 / bpm * (1 + 0.04 * sin(k)); k += 1
-            }
-            var x = ECGSynth.samples(beats: beats, start: 0, count: Int(10 * fs), rate: fs)
-            if inverted { x = x.map { -$0 } }
-            let peaks = ECGAnalyzer.rPeaks(x, sampleRate: fs)
-            let truth = beats.filter { $0 < 10 }
-            XCTAssertEqual(peaks.count, truth.count, "fs \(fs) bpm \(bpm)")
-            for p in peaks {
-                let nearest = truth.map { abs($0 - Double(p) / fs) }.min() ?? 1
-                XCTAssertLessThan(nearest, 0.015)
-            }
-            let rr = ECGAnalyzer.rrIntervals(peaks: peaks, sampleRate: fs)
-            XCTAssertEqual(60_000 / (Stats.median(rr) ?? 1), bpm, accuracy: bpm * 0.06)
+    private func beats(bpm: Double) -> [Double] {
+        var beats: [Double] = []
+        var t = 0.37
+        var k = 0.0
+        while t < 12 {
+            beats.append(t)
+            t += 60 / bpm * (1 + 0.04 * sin(k)); k += 1
         }
+        return beats
+    }
+
+    func testECGPeaksAtAnyPolarityRateAndTWave() {
+        let cases: [(fs: Double, bpm: Double, inverted: Bool, tAmp: Double, tDelay: Double)] = [
+            (100, 62, false, 0.3, 0.25), (100, 62, false, 0.8, 0.30), (100, 75, true, 0.9, 0.32),
+            (128, 45, true, 0.7, 0.35), (250, 72, false, 0.3, 0.25), (100, 150, false, 0.5, 0.25),
+        ]
+        for c in cases {
+            let truthBeats = beats(bpm: c.bpm)
+            var x = ECGSynth.samples(beats: truthBeats, start: 0, count: Int(10 * c.fs), rate: c.fs,
+                                     tWave: (c.tAmp, c.tDelay))
+            if c.inverted { x = x.map { -$0 } }
+            let peaks = ECGAnalyzer.rPeaks(x, sampleRate: c.fs)
+            let truth = truthBeats.filter { $0 < 10 }
+            XCTAssertLessThanOrEqual(abs(peaks.count - truth.count), 1, "fs \(c.fs) bpm \(c.bpm) T \(c.tAmp)")
+            for p in peaks {
+                let nearest = truth.map { abs($0 - Double(p) / c.fs) }.min() ?? 1
+                XCTAssertLessThan(nearest, 0.015, "a detection is not on an R peak (T wave counted?)")
+            }
+            let rr = ECGAnalyzer.rrIntervals(peaks: peaks, sampleRate: c.fs)
+            XCTAssertEqual(60_000 / (Stats.median(rr) ?? 1), c.bpm, accuracy: c.bpm * 0.05)
+        }
+    }
+
+    func testNoisyECGWithPPGHint() {
+        let fs = 100.0, bpm = 70.0
+        let truthBeats = beats(bpm: bpm)
+        let x = ECGSynth.samples(beats: truthBeats, start: 0, count: Int(10 * fs), rate: fs,
+                                 tWave: (0.6, 0.30), noise: 0.12, seed: 4)
+        let peaks = ECGAnalyzer.rPeaks(x, sampleRate: fs, expectedRR: 60 / bpm)
+        let truth = truthBeats.filter { $0 < 10 }
+        XCTAssertLessThanOrEqual(abs(peaks.count - truth.count), 1)
+        let rr = ECGAnalyzer.rrIntervals(peaks: peaks, sampleRate: fs)
+        XCTAssertEqual(60_000 / (Stats.median(rr) ?? 1), bpm, accuracy: bpm * 0.05)
+    }
+
+    func testSampleRateIgnoresStartupBurst() throws {
+        // 250 buffered samples delivered at once, then 100 samples every second with jitter.
+        var est = ECGRateEstimator()
+        est.add(arrival: 0, strapTime: nil, samples: 100)
+        est.add(arrival: 0.05, strapTime: nil, samples: 100)
+        est.add(arrival: 0.10, strapTime: nil, samples: 50)
+        for i in 1...12 { est.add(arrival: Double(i) + 0.1 * sin(Double(i)), strapTime: nil, samples: 100) }
+        let a = try XCTUnwrap(est.estimate)
+        XCTAssertEqual(a.rate, 100)
+        XCTAssertEqual(a.source, .arrival)
+        // The naive "samples ÷ elapsed" that the first version used would have said ~120+.
+        // With a plausible strap clock, the strap clock wins.
+        var clocked = ECGRateEstimator()
+        for i in 0..<6 { clocked.add(arrival: 0.01 * Double(i), strapTime: 1_700_000_000 + Double(i) * 0.8, samples: 100) }
+        let b = try XCTUnwrap(clocked.estimate)
+        XCTAssertEqual(b.rate, 125)
+        XCTAssertEqual(b.source, .strapClock)
     }
 
     func testEffortEstimates() {

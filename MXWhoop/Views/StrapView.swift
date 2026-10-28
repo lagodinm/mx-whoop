@@ -39,6 +39,26 @@ struct StrapView: View {
                     row("Last event", hub.lastEvent?.name)
                 }
 
+                Section {
+                    DataSafetyRows()
+                    NavigationLink { WhoopAppActivityView() } label: {
+                        Label("WHOOP app activity", systemImage: "arrow.left.arrow.right")
+                    }
+                } header: {
+                    Text("Your WHOOP data")
+                } footer: {
+                    Text("The strap deletes stored data only after receiving HISTORICAL_DATA_RESULT, the acknowledgement that follows a sync. MX Whoop has no code path that can send it (a unit test enforces this). It reads copies of what passes over the link.")
+                }
+
+                Section("Explore") {
+                    NavigationLink { StrapInternalsView() } label: {
+                        Label("Strap internals: settings, flags, alarms", systemImage: "cpu")
+                    }
+                    NavigationLink { FirmwareConsoleView() } label: {
+                        Label("Firmware console (\(hub.consoleLines.count) lines)", systemImage: "terminal")
+                    }
+                }
+
                 Section("Settings") {
                     Toggle("Buzz the strap on a LIE verdict", isOn: $hub.buzzOnLie)
                     Toggle(isOn: Binding(get: { hub.biometrics.fastSyncWanted }, set: { hub.biometrics.fastSyncWanted = $0 })) {
@@ -93,5 +113,24 @@ struct StrapView: View {
 
     private func row(_ title: String, _ value: String?) -> some View {
         LabeledContent(title, value: value ?? "—")
+    }
+}
+
+/// Live evidence that the WHOOP app keeps syncing and acknowledging its own data.
+private struct DataSafetyRows: View {
+    @Environment(SensorHub.self) private var hub
+
+    var body: some View {
+        let acks = hub.foreignCounts["HISTORICAL_DATA_RESULT"] ?? 0
+        let syncs = hub.foreignCounts["SEND_HISTORICAL_DATA"] ?? 0
+        LabeledContent("History acknowledged by MX Whoop", value: "never")
+        LabeledContent("WHOOP app syncs seen", value: hub.whoopAppPresent ? "\(syncs) syncs · \(acks) chunks acked" : "none yet")
+        if let range = hub.biometrics.dataRange {
+            LabeledContent("Waiting on strap for WHOOP", value: "\(range.pagesBehind) pages")
+        }
+        if hub.whoopAppUsesSensors {
+            Label("The WHOOP app is using a sensor session; MX Whoop won't stop it.", systemImage: "hand.raised")
+                .font(.caption).foregroundStyle(Theme.warning)
+        }
     }
 }

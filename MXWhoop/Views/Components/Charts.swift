@@ -121,6 +121,8 @@ struct TemperatureChart: View {
 struct ECGWaveform: View {
     let samples: [Double]
     var sampleRate: Double?
+    /// Indices into `samples` of detected R peaks, drawn as dots so detection is visible.
+    var peaks: [Int] = []
 
     var body: some View {
         Canvas { ctx, size in
@@ -144,14 +146,19 @@ struct ECGWaveform: View {
             let lo = sorted[Int(Double(sorted.count - 1) * 0.005)]
             let hi = sorted[Int(Double(sorted.count - 1) * 0.995)]
             let span = max(hi - lo, 1)
-            var trace = Path()
-            for (i, v) in samples.enumerated() {
+            func point(_ i: Int) -> CGPoint {
                 let px = size.width * CGFloat(i) / CGFloat(samples.count - 1)
-                let norm = min(max((v - lo) / span, -0.05), 1.05)
-                let py = size.height * (0.92 - 0.84 * CGFloat(norm))
-                if i == 0 { trace.move(to: CGPoint(x: px, y: py)) } else { trace.addLine(to: CGPoint(x: px, y: py)) }
+                let norm = min(max((samples[i] - lo) / span, -0.05), 1.05)
+                return CGPoint(x: px, y: size.height * (0.92 - 0.84 * CGFloat(norm)))
             }
+            var trace = Path()
+            trace.move(to: point(0))
+            for i in 1..<samples.count { trace.addLine(to: point(i)) }
             ctx.stroke(trace, with: .color(Theme.heart), lineWidth: 1.6)
+            for i in peaks where i >= 0 && i < samples.count {
+                let p = point(i)
+                ctx.fill(Path(ellipseIn: CGRect(x: p.x - 3.5, y: p.y - 3.5, width: 7, height: 7)), with: .color(Theme.warning))
+            }
         }
         .frame(height: 190)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.35)))

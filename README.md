@@ -71,13 +71,49 @@ these records in three ways, none of which can lose data:
   `ABORT_HISTORICAL_TRANSMITS`. The strap shows the first chunk after the last sync and keeps everything.
   Its next attempt restarts from the acknowledged position.
 
+### Does MX Whoop affect the official app's data?
+
+The strap deletes stored records only after `HISTORICAL_DATA_RESULT` (23), the acknowledgement sent after a
+sync. MX Whoop has no way to send it: the command isn't in its command set, and a unit test enforces this. Everything
+it reads is a copy of a Bluetooth notification. The strap's replies to the *official app's* commands also reach
+MX Whoop, which lets it see that app syncing and acknowledging its own data (Strap tab › WHOOP app activity). The
+same signal is used to avoid side effects on shared switches:
+
+* `STOP_RAW_DATA` clears every app's raw and per-sensor sessions, so it is not sent while the WHOOP app is
+  using a sensor session (for example Strength Trainer). MX Whoop's own request then expires.
+* Live HR is left on at disconnect when the WHOOP app is around.
+* Fast sync is only ended if MX Whoop started it and the WHOOP app didn't ask for it too.
+* "Read strap memory" only runs when the WHOOP app has been quiet for 5 minutes, so it can't interrupt a sync.
+
+### More from the strap (read-only)
+
+* **Strap internals**: the 8 device settings and 20 feature flags, read by name with 121/128. The
+  enumeration commands are never used, because the official app shares their cursor. Also shown: the haptic
+  alarm slots (67), the MG battery pack (151), clock drift (147) and gyro mode (152).
+* **Firmware console**: packet 50 text, reassembled. The text starts at offset 21 and is NUL-terminated per
+  fragment.
+* **Raw extras** from each summary record: alternate HR (37), cadence-like byte (59), state bits (81), the
+  unvalidated SpO₂ candidate (82), optical baseline/amplitude (106–109) and arm tilt from gravity.
+* **Archive**: every summary record seen goes to `Documents/StrapArchive/strap-YYYY-MM-DD.csv`. The Live tab
+  charts the last 24 h of skin temperature, heart rate, the strap's sleep state and steps.
+
 ### ECG (WHOOP MG, experimental)
 
 `SELECT_WRIST [01, 01 right / 02 left]` → `TOGGLE_LABRADOR_FILTERED [01, 01]` → `TOGGLE_LABRADOR_DATA_GENERATION
 [01, 02]`. These payloads come from the official app's builders. Filtered ECG then arrives as packet 43 / layout 17
 (240 bytes, up to 100 i16 samples). To stop: generation `[01, 01]`, then filtered `[01, 00]`. The app never resends
-START on reconnect. If it was closed mid-recording, the next connection sends the stop sequence. The sample rate
-isn't documented, so it's estimated from arrival times.
+START on reconnect. If it was closed mid-recording, the next connection sends the stop sequence.
+
+Like the official app, a session first **calibrates**, then records 30 s:
+
+* **Sample rate.** It isn't documented. It comes from a regression on the record's own clock when that looks
+  like Unix time, and otherwise on arrival times excluding the first 1.5 s. It is snapped to a standard rate
+  and remembered. A naive "samples ÷ elapsed time" estimate reads ~50 % high at first, because the strap
+  delivers its 250-sample buffer in a burst, and that inflated the heart rate in v1.1.
+* **Beats.** A Pan–Tompkins detector: zero-phase 5–15 Hz band-pass, adaptive thresholds, T-wave rejection and
+  search-back. The refractory period follows the strap's optical heart rate.
+* **Recording.** It only starts once the rhythm is regular and agrees with the optical HR. It ends with a
+  summary: average, range, beats, and RMSSD/SDNN from ECG beats.
 
 **If pairing is refused:** the strap is probably bonded to another phone. Tap the strap until the LED
 flashes blue (pairing mode) and connect again. If iOS remembers a stale pairing, forget the strap in

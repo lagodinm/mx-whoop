@@ -150,6 +150,16 @@ public enum SyntheticFrames {
         return [0x01] + fields.flatMap(\.littleEndianBytes)
     }
 
+    /// Firmware console fragment (packet 50): `[9] seq · [12] time · [18] u16 length · [20] 01 · [21…] text NUL`.
+    public static func console(sequence: UInt8, time: UInt32, text: String) -> WhoopFrame {
+        let bytes = Array(text.utf8.prefix(200)) + [0]
+        var body: [UInt8] = [PacketType.consoleLogs.rawValue, sequence, 0x02, 0x00]
+        body += time.littleEndianBytes + [0, 0]
+        body += UInt16(bytes.count).littleEndianBytes + [0x01]
+        body += bytes
+        return frame(body: body)
+    }
+
     public static func event(_ number: UInt8, time: UInt32) -> WhoopFrame {
         frame(body: [PacketType.event.rawValue, 0x00, number, 0x00] + time.littleEndianBytes)
     }

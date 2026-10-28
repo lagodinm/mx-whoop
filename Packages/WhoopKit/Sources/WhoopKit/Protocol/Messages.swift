@@ -41,7 +41,47 @@ public struct CommandResponse: Equatable, Sendable {
     public let body: [UInt8]
 
     public var result: CommandResult? { CommandResult(rawValue: resultRaw) }
-    public var commandName: String { WhoopCommand(rawValue: command)?.name ?? "cmd \(command)" }
+    public var commandName: String { CommandNames.name(command) }
+}
+
+/// Names for every command number the official app defines (decompiled `EnumC26340e`), so
+/// responses to *other* apps' commands can be labelled. Naming a command here does not
+/// make it sendable: `WhoopCommand` is the list this app actually uses.
+public enum CommandNames {
+    public static func name(_ command: UInt8) -> String {
+        official[command] ?? "cmd \(command)"
+    }
+
+    public static let official: [UInt8: String] = [
+        1: "LINK_VALID", 2: "GET_MAX_PROTOCOL_VERSION", 3: "TOGGLE_REALTIME_HR", 7: "REPORT_VERSION_INFO",
+        10: "SET_CLOCK_DEPRECATED", 11: "GET_CLOCK_DEPRECATED", 14: "TOGGLE_GENERIC_HR_PROFILE",
+        15: "FORGET_BONDS", 16: "TOGGLE_R7_DATA_COLLECTION", 19: "RUN_HAPTIC_PATTERN",
+        20: "ABORT_HISTORICAL_TRANSMITS", 22: "SEND_HISTORICAL_DATA", 23: "HISTORICAL_DATA_RESULT",
+        25: "FORCE_TRIM", 26: "GET_BATTERY_LEVEL", 29: "REBOOT_STRAP", 32: "POWER_CYCLE_STRAP",
+        33: "SET_READ_POINTER", 34: "GET_DATA_RANGE", 35: "GET_HELLO_HARVARD", 36: "START_FIRMWARE_LOAD",
+        37: "LOAD_FIRMWARE_DATA", 38: "PROCESS_FIRMWARE_IMAGE", 39: "SET_LED_DRIVE", 40: "GET_LED_DRIVE",
+        41: "SET_TIA_GAIN", 42: "GET_TIA_GAIN", 43: "SET_BIAS_OFFSET", 44: "GET_BIAS_OFFSET",
+        45: "ENTER_BLE_DFU", 48: "SEND_EVENT_PACKETS", 52: "SET_DP_TYPE", 53: "FORCE_DP_TYPE",
+        61: "SET_AFE_PARAMETERS", 62: "GET_AFE_PARAMETERS", 63: "SEND_R10_R11_REALTIME",
+        66: "SET_ALARM_TIME", 67: "GET_ALARM_TIME", 68: "RUN_ALARM", 69: "DISABLE_ALARM",
+        76: "GET_ADVERTISING_NAME_HARVARD", 77: "SET_ADVERTISING_NAME_HARVARD", 79: "RUN_HAPTICS_PATTERN",
+        80: "GET_ALL_HAPTICS_PATTERN", 81: "START_RAW_DATA", 82: "STOP_RAW_DATA",
+        83: "VERIFY_FIRMWARE_IMAGE", 84: "GET_BODY_LOCATION_AND_STATUS", 96: "ENTER_HIGH_FREQ_SYNC",
+        97: "EXIT_HIGH_FREQ_SYNC", 98: "GET_EXTENDED_BATTERY_INFO", 103: "DISABLE_BLE_UART",
+        105: "TOGGLE_IMU_MODE_HISTORICAL", 106: "TOGGLE_IMU_MODE", 107: "ENABLE_OPTICAL_DATA",
+        108: "TOGGLE_OPTICAL_MODE", 115: "START_DEVICE_CONFIG_KEY_EXCHANGE", 116: "SEND_NEXT_DEVICE_CONFIG",
+        117: "START_FF_KEY_EXCHANGE", 118: "SEND_NEXT_FF", 119: "SET_DEVICE_CONFIG_VALUE",
+        120: "SET_FF_VALUE", 121: "GET_DEVICE_CONFIG_VALUE", 122: "STOP_HAPTICS", 123: "SELECT_WRIST",
+        124: "TOGGLE_LABRADOR_DATA_GENERATION", 125: "TOGGLE_LABRADOR_RAW_SAVE", 126: "SEND_RAW_ECG",
+        127: "SAVE_FILTERED_ECG", 128: "GET_FF_VALUE", 131: "SET_RESEARCH_PACKET", 132: "GET_RESEARCH_PACKET",
+        138: "SET_SIGNAL_PROCESSING_CONFIG", 139: "TOGGLE_LABRADOR_FILTERED", 140: "SET_ADVERTISING_NAME",
+        141: "GET_ADVERTISING_NAME", 142: "START_FIRMWARE_LOAD_NEW", 143: "LOAD_FIRMWARE_DATA_NEW",
+        144: "PROCESS_FIRMWARE_IMAGE_NEW", 145: "GET_HELLO", 146: "SET_CLOCK", 147: "GET_CLOCK",
+        148: "SET_WEAR_DETECTION_OVERRIDE", 149: "SET_LED_ACCESSIBILITY", 150: "SET_GYRO_MODE",
+        151: "GET_BATTERY_PACK_INFO", 152: "GET_GYRO_MODE", 153: "TOGGLE_PERSISTENT_R20",
+        154: "TOGGLE_PERSISTENT_R21", 155: "START_CERTIFICATE_TRANSFER", 156: "LOAD_CERTIFICATE",
+        157: "VERIFY_CERTIFICATE", 158: "PROCESS_CERTIFICATE", 159: "LOCK_DEVICE",
+    ]
 }
 
 public struct StrapEvent: Equatable, Sendable {
@@ -102,6 +142,57 @@ public struct BiometricRecord: Equatable, Sendable {
     public let activity: Activity?
     public let bandState: BandState
     public let qualityFlags: UInt8
+    /// Raw fields whose meaning is not established; shown for exploration only.
+    public let extras: Extras
+
+    public struct Extras: Equatable, Sendable {
+        /// Byte 37: an alternate HR in bpm (validity convention unresolved).
+        public let alternateHR: UInt8
+        /// Byte 59: cadence-like raw value; not a documented steps-per-minute scale.
+        public let cadenceRaw: UInt8
+        /// Byte 81 whole: four two-bit state groups (wrist, wake quality, motion/rest, other).
+        public let stateBits: UInt8
+        /// Byte 82: sleep-adjacent raw byte that noop studies as an SpO₂ candidate. Unvalidated.
+        public let spo2CandidateRaw: UInt8
+        /// Bytes 106/107: optical baseline-like values (0 = off wrist in an earlier interpretation).
+        public let opticalBaseline: [UInt8]
+        /// Bytes 108/109: optical amplitude-like values (both 128 = quality sentinel).
+        public let opticalAmplitude: [UInt8]
+    }
+}
+
+/// A line-oriented fragment of the strap's firmware console (packet 50).
+public struct ConsoleFragment: Equatable, Sendable {
+    /// Wrapping sequence at frame byte 9.
+    public let sequence: UInt8
+    public let strapTime: UInt32
+    public let text: String
+}
+
+/// A named configuration or feature-flag value (GET 121 / 128 reply).
+public struct ConfigValue: Equatable, Sendable {
+    public let key: String
+    /// Formatted text (`0`/`1`/`2`, an integer or one decimal). Empty if the strap returned
+    /// a zero-filled fallback.
+    public let value: String
+    public let isFeatureFlag: Bool
+}
+
+/// One of the strap's six haptic alarm slots (GET_ALARM_TIME 67, revision 4).
+public struct AlarmSlot: Equatable, Sendable {
+    public let id: UInt8
+    /// nil when the slot is empty (or the read fell back to zeros).
+    public let time: UInt32?
+    public let repeats: UInt8
+    public let duration: UInt8
+    public let crescendo: Bool
+}
+
+/// GET_BATTERY_PACK_INFO (151): cached info about the MG's slide-on battery pack.
+public struct BatteryPackInfo: Equatable, Sendable {
+    public let present: Bool
+    /// Raw charge word; noop treats `/10` as a display convention, not a confirmed scale.
+    public let chargeRaw: UInt16
 }
 
 /// One MG ECG record: layout 17 (filtered, i16) or 16 (raw, 18-bit). Amplitude is in the
@@ -112,6 +203,10 @@ public struct ECGRecord: Equatable, Sendable {
     /// Packet 43 (live) rather than 47 (replayed by a sync).
     public let isLive: Bool
     public let sequence: UInt32
+    /// Timestamp words at 15 (u32) and 19 (u16); units not established. When the first
+    /// looks like Unix seconds, the app treats the second as 1/32768 s ticks.
+    public let timestampMain: UInt32
+    public let timestampExtra: UInt16
     /// Byte 21; observed 0–3, vocabulary unresolved.
     public let quality: UInt8
     /// Byte 22: classifier-state transition bits, bit 3 = presence.
@@ -173,7 +268,7 @@ public enum WhoopMessage: Equatable, Sendable {
     case ecg(ECGRecord)
     case commandResponse(CommandResponse)
     case event(StrapEvent)
-    case consoleLog(String)
+    case consoleLog(ConsoleFragment)
     case metadata(packetType: UInt8, kind: UInt8)
     /// A valid frame we don't decode (other history layouts, unknown types…).
     case other(packetType: UInt8, layout: UInt8)

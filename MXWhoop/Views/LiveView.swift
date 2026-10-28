@@ -11,6 +11,7 @@ struct LiveView: View {
                     if !hub.linkState.isConnected { ConnectCard() }
                     HeartHero()
                     SkinTempCard()
+                    DayCard()
                     Card("Heart rate · 5 min", systemImage: "heart.fill") {
                         HeartRateChart(samples: hub.timeline.heartRate)
                     }

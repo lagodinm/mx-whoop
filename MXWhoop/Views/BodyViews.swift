@@ -35,6 +35,13 @@ struct SkinTempCard: View {
                 MetricTile(title: "Strap state", value: stateText(bio.latest?.bandState))
                 MetricTile(title: "Records", value: "\(bio.recordsSeen)")
             }
+            if let extras = bio.latest?.extras {
+                DisclosureGroup("More raw fields from this record") {
+                    ExtrasGrid(extras: extras, record: bio.latest)
+                }
+                .font(.callout)
+                .tint(Theme.muted)
+            }
             SyncStatus(bio: bio)
             Toggle(isOn: $bio.fastSyncWanted) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -204,5 +211,114 @@ struct ZoneBar: View {
             }
         }
         .animation(.snappy, value: zone)
+    }
+}
+
+/// Bytes of the one-second summary whose meaning isn't established; here for exploring.
+private struct ExtrasGrid: View {
+    let extras: BiometricRecord.Extras
+    let record: BiometricRecord?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                MetricTile(title: "Alt. HR", value: "\(extras.alternateHR)", unit: "bpm")
+                MetricTile(title: "Cadence raw", value: "\(extras.cadenceRaw)")
+                MetricTile(title: "SpO₂ cand.", value: "\(extras.spo2CandidateRaw)", footnote: "byte 82, raw")
+                MetricTile(title: "Optical base", value: extras.opticalBaseline.map { String($0) }.joined(separator: "/"))
+                MetricTile(title: "Optical amp", value: extras.opticalAmplitude.map { String($0) }.joined(separator: "/"))
+                MetricTile(title: "Tilt", value: tilt.map { "\(Int($0))°" } ?? "--", footnote: "arm vs vertical")
+            }
+            Text("State bits \(String(extras.stateBits, radix: 2)) · quality flags 0x\(String(record?.qualityFlags ?? 0, radix: 16)) · dynamic accel \(fmt(record?.dynamicAccelG, digits: 3)) g. Byte 82 is studied by the noop project as a possible SpO₂ value during sleep; it is not validated, so treat it as a curiosity.")
+                .font(.caption2).foregroundStyle(Theme.muted)
+        }
+        .padding(.top, 6)
+    }
+
+    /// Angle between the strap's gravity vector and its z axis.
+    private var tilt: Double? {
+        guard let g = record?.gravity else { return nil }
+        let norm = Double((g * g).sum().squareRoot())
+        guard norm > 0.3 else { return nil }
+        return acos(Double(g.z) / norm) * 180 / .pi
+    }
+}
+
+/// The last 24 hours of the strap's own per-second summaries, archived on this iPhone.
+struct DayCard: View {
+    @Environment(SensorHub.self) private var hub
+
+    var body: some View {
+        let bins = hub.biometrics.dayBins
+        let archive = hub.biometrics.archive
+        Card("Last 24 hours · strap memory", systemImage: "calendar.day.timeline.left",
+             trailing: AnyView(ShareLink(items: archive.files) { Image(systemName: "square.and.arrow.up") }
+                .disabled(archive.files.isEmpty))) {
+            if bins.isEmpty {
+                EmptyChartLabel(text: "Fills in as the WHOOP app syncs while MX Whoop is connected, even in the background.")
+                    .frame(maxWidth: .infinity, minHeight: 60)
+            } else {
+                DayCharts(bins: bins)
+                summary(bins)
+            }
+            Text("Every one-second record that passes by is saved to Files › MX Whoop › StrapArchive (CSV, one file per day). Gaps are times when MX Whoop wasn't connected.")
+                .font(.caption2).foregroundStyle(Theme.muted)
+        }
+    }
+
+    private func summary(_ bins: [MinuteBin]) -> some View {
+        let temps = bins.compactMap(\.skinTemp)
+        let hrs = bins.compactMap(\.heartRate)
+        let sleepMinutes = bins.filter { $0.sleepShare >= 0.5 }.count
+        let steps = bins.reduce(0) { $0 + $1.steps }
+        return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            MetricTile(title: "Skin range", value: temps.isEmpty ? "--" : String(format: "%.1f–%.1f", temps.min() ?? 0, temps.max() ?? 0), unit: "°C")
+            MetricTile(title: "Lowest HR", value: fmt(lowestMinuteHR(bins)), unit: "bpm", footnote: "5-min mean")
+            MetricTile(title: "Avg HR", value: fmt(Stats.mean(hrs)), unit: "bpm")
+            MetricTile(title: "Strap 'sleep'", value: String(format: "%d:%02d", sleepMinutes / 60, sleepMinutes % 60), unit: "h")
+            MetricTile(title: "Steps", value: "\(steps)")
+            MetricTile(title: "Coverage", value: "\(Int(Double(bins.count) / 14.4))", unit: "%", footnote: "of 24 h")
+        }
+    }
+
+    private func lowestMinuteHR(_ bins: [MinuteBin]) -> Double? {
+        let hr = bins.compactMap(\.heartRate)
+        guard hr.count >= 5 else { return nil }
+        return (0...(hr.count - 5)).map { Stats.mean(Array(hr[$0..<($0 + 5)])) ?? .infinity }.min()
+    }
+}
+
+private struct DayCharts: View {
+    let bins: [MinuteBin]
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Chart(bins.filter { $0.skinTemp != nil }) { b in
+                LineMark(x: .value("Time", b.date), y: .value("°C", b.skinTemp ?? 0))
+                    .foregroundStyle(Theme.warning)
+            }
+            .chartYScale(domain: .automatic(includesZero: false))
+            .chartXAxis(.hidden)
+            .frame(height: 80)
+            Chart(bins.filter { $0.heartRate != nil }) { b in
+                LineMark(x: .value("Time", b.date), y: .value("BPM", b.heartRate ?? 0))
+                    .foregroundStyle(Theme.heart)
+            }
+            .chartYScale(domain: .automatic(includesZero: false))
+            .chartXAxis(.hidden)
+            .frame(height: 70)
+            Chart(bins.filter { $0.sleepShare >= 0.5 }) { b in
+                RectangleMark(xStart: .value("Start", b.date), xEnd: .value("End", b.date.addingTimeInterval(60)),
+                              yStart: .value("Low", 0), yEnd: .value("High", 1))
+                    .foregroundStyle(Theme.motion.opacity(0.8))
+            }
+            .chartYAxis(.hidden)
+            .chartXScale(domain: (bins.first?.date ?? .now)...(bins.last?.date ?? .now))
+            .chartXAxis { AxisMarks(values: .automatic(desiredCount: 5)) }
+            .frame(height: 34)
+            .overlay(alignment: .leading) {
+                Text("strap 'sleep' state").font(.caption2).foregroundStyle(Theme.muted).padding(.leading, 4)
+            }
+        }
     }
 }

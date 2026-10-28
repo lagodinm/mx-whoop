@@ -61,6 +61,7 @@ public enum WhoopCommand: UInt8, Sendable {
     case startRawData = 81
     case stopRawData = 82
     case getBodyLocationAndStatus = 84
+    case getAlarmTime = 67
     case enterHighFreqSync = 96
     case exitHighFreqSync = 97
     case toggleIMUModeHistorical = 105
@@ -70,11 +71,14 @@ public enum WhoopCommand: UInt8, Sendable {
     case stopHaptics = 122
     case selectWrist = 123                // MG ECG
     case toggleECGGeneration = 124        // TOGGLE_LABRADOR_DATA_GENERATION
+    case getDeviceConfigValue = 121       // read by name, no shared cursor
+    case getFeatureFlagValue = 128        // read by name, no shared cursor
     case toggleECGFiltered = 139          // TOGGLE_LABRADOR_FILTERED (live output)
     case getHello = 145
     case setClock = 146
     case getClock = 147
     case getBatteryPackInfo = 151
+    case getGyroMode = 152
 
     public var name: String { String(describing: self) }
 }
@@ -183,6 +187,27 @@ public enum CommandBody {
 
     public static let exitHighFreqSync = Request(command: WhoopCommand.exitHighFreqSync.rawValue, params: [0x00],
                                                  label: "EXIT_HIGH_FREQ_SYNC")
+
+    // MARK: Read-only strap internals
+
+    /// GET_DEVICE_CONFIG_VALUE (121) / GET_FF_VALUE (128): revision 1 + a 32-byte NUL-padded key.
+    /// Lookup by name never touches the enumeration cursor the official app uses.
+    public static func readConfig(_ key: String, featureFlag: Bool) -> Request {
+        var field = Array(key.utf8.prefix(31))
+        field += [UInt8](repeating: 0, count: 32 - field.count)
+        let command = featureFlag ? WhoopCommand.getFeatureFlagValue : WhoopCommand.getDeviceConfigValue
+        return Request(command: command.rawValue, params: [0x01] + field,
+                       label: "\(featureFlag ? "GET_FF_VALUE" : "GET_DEVICE_CONFIG_VALUE") \(key)")
+    }
+
+    /// GET_ALARM_TIME (67) revision 4 for slot 1–6.
+    public static func alarm(slot: UInt8) -> Request {
+        Request(command: WhoopCommand.getAlarmTime.rawValue, params: [0x04, slot], label: "GET_ALARM_TIME #\(slot)")
+    }
+
+    public static let batteryPack = Request(command: WhoopCommand.getBatteryPackInfo.rawValue, params: [0x01],
+                                            label: "GET_BATTERY_PACK_INFO")
+    public static let gyroMode = Request(command: WhoopCommand.getGyroMode.rawValue, params: [0x01], label: "GET_GYRO_MODE")
 
     // MARK: MG ECG
 
