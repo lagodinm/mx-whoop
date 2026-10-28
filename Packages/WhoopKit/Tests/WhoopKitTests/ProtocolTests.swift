@@ -136,6 +136,11 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(m?.rrIntervalsMs, [1000, 937.5])
     }
 
+    func testHistoricalIMUIsNotTreatedAsLive() {
+        let f = SyntheticFrames.imuR21(time: 1_700_000_000, accel: [SIMD3(0, 0, 1)], gyro: [], packetType: .historicalData)
+        XCTAssertEqual(WhoopParser.parse(f), .other(packetType: 47, layout: 21))
+    }
+
     func testVariantResolution() {
         XCTAssertEqual(WhoopVariant.resolve(model: "MG", serial: nil, hardwareRevision: nil), .mg)
         XCTAssertEqual(WhoopVariant.resolve(model: nil, serial: "5AM123", hardwareRevision: nil), .mg)

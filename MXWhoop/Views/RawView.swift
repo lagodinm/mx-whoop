@@ -84,6 +84,7 @@ private struct RawRow: View {
         switch entry.kind {
         case .hr: return Theme.heart
         case .imu: return Theme.motion
+        case .body: return Theme.warning
         case .event: return Theme.truth
         case .command: return Theme.accent
         case .other: return Theme.muted
@@ -158,6 +159,7 @@ private struct CommandConsole: View {
             ("HR off", "heart.slash", CommandBody.realtimeHR(false)),
             ("Get clock", "clock", CommandBody.getClock),
             ("Wear status", "hand.raised", CommandBody.bodyLocation),
+            ("Data range", "externaldrive", CommandBody.dataRange),
         ]
     }
 
@@ -174,7 +176,7 @@ private struct CommandConsole: View {
                 }
             }
             .disabled(hub.linkState != .streaming)
-            Text("Only safe, non-persistent commands are offered. History offload, trims, reboots, firmware and pairing resets are deliberately not exposed.")
+            Text("Only safe, non-persistent commands are offered. History acknowledgements, trims, read-pointer changes, reboots, firmware and pairing resets are deliberately not exposed.")
                 .font(.caption2).foregroundStyle(Theme.muted)
         }
     }

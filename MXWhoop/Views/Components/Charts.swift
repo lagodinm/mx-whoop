@@ -95,6 +95,71 @@ struct OpticalChart: View {
     }
 }
 
+/// Skin temperature by measurement time (points arrive in bursts, whenever a sync runs).
+struct TemperatureChart: View {
+    let points: [TimedValue]
+
+    var body: some View {
+        Chart(points, id: \.t) { p in
+            LineMark(x: .value("Time", date(p.t)), y: .value("°C", p.v))
+                .foregroundStyle(Theme.warning)
+                .interpolationMethod(.monotone)
+            if points.count < 30 {
+                PointMark(x: .value("Time", date(p.t)), y: .value("°C", p.v))
+                    .foregroundStyle(Theme.warning)
+                    .symbolSize(12)
+            }
+        }
+        .chartYScale(domain: .automatic(includesZero: false))
+        .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
+        .overlay { if points.isEmpty { EmptyChartLabel(text: "Waiting for the first stored records (WHOOP app sync or “Read strap memory”)") } }
+        .frame(height: 110)
+    }
+}
+
+/// Live ECG trace on a paper-like grid. Native units, auto-scaled to the window.
+struct ECGWaveform: View {
+    let samples: [Double]
+    var sampleRate: Double?
+
+    var body: some View {
+        Canvas { ctx, size in
+            let seconds = sampleRate.map { Double(samples.count) / $0 } ?? 4
+            let minor: CGFloat = size.width / CGFloat(max(seconds, 1) * 5) // 0.2 s squares
+            if minor > 2 {
+                var grid = Path()
+                var x: CGFloat = 0
+                while x <= size.width {
+                    grid.move(to: CGPoint(x: x, y: 0)); grid.addLine(to: CGPoint(x: x, y: size.height)); x += minor
+                }
+                var y: CGFloat = 0
+                while y <= size.height {
+                    grid.move(to: CGPoint(x: 0, y: y)); grid.addLine(to: CGPoint(x: size.width, y: y)); y += minor
+                }
+                ctx.stroke(grid, with: .color(Theme.heart.opacity(0.12)), lineWidth: 0.5)
+            }
+
+            guard samples.count > 1 else { return }
+            let sorted = samples.sorted()
+            let lo = sorted[Int(Double(sorted.count - 1) * 0.005)]
+            let hi = sorted[Int(Double(sorted.count - 1) * 0.995)]
+            let span = max(hi - lo, 1)
+            var trace = Path()
+            for (i, v) in samples.enumerated() {
+                let px = size.width * CGFloat(i) / CGFloat(samples.count - 1)
+                let norm = min(max((v - lo) / span, -0.05), 1.05)
+                let py = size.height * (0.92 - 0.84 * CGFloat(norm))
+                if i == 0 { trace.move(to: CGPoint(x: px, y: py)) } else { trace.addLine(to: CGPoint(x: px, y: py)) }
+            }
+            ctx.stroke(trace, with: .color(Theme.heart), lineWidth: 1.6)
+        }
+        .frame(height: 190)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.35)))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay { if samples.isEmpty { EmptyChartLabel(text: "Press Start, then hold a finger on the clasp") } }
+    }
+}
+
 struct EmptyChartLabel: View {
     let text: String
     var body: some View {

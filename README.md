@@ -10,10 +10,11 @@ streams its raw data and analyses it on the phone. Includes a just-for-fun **Lie
 
 | Tab | What it does |
 |---|---|
-| **Live** | Heart rate (5 min chart), beat-to-beat R-R tachogram, HRV (RMSSD, SDNN, pNN50), breathing rate from sinus arrhythmia, 100 Hz 3-axis motion, micro-tremor, experimental optical stream, live arousal gauge, CSV recording/export |
+| **Live** | Heart rate (5 min chart), **skin temperature** (+ two auxiliary thermal channels, steps, activity, strap state), **effort** (HR zone, calories, 0–21 strain estimate, resting HR), beat-to-beat R-R tachogram, HRV (RMSSD, SDNN, pNN50, **Baevsky stress index, LF/HF**), breathing rate from sinus arrhythmia, 100 Hz 3-axis motion, micro-tremor, experimental optical stream, live arousal gauge, CSV recording/export |
 | **Lie Detector** | 60 s baseline → 3 truthful + 3 deliberate-lie calibration statements → ask anything → **TRUTH / LIE with a percentage**, per-signal breakdown, history, optional strap buzz on LIE |
-| **Raw** | Every frame decoded and hex-dumped, packet counters, CRC failures, safe command console (hello, battery, buzz, live HR on/off, clock, wear status) |
-| **Strap** | Connect / disconnect / demo mode, device info (MG vs 5.0, firmware, battery, worn), connection log |
+| **ECG** *(experimental, MG)* | Live single-lead ECG trace from the MG clasp, heart rate and R-R from detected R peaks, strap contact/quality/progress codes, auto-stop |
+| **Raw** | Every frame decoded and hex-dumped, packet counters, CRC failures, safe command console (hello, battery, buzz, live HR on/off, clock, wear status, data range) |
+| **Strap** | Connect / disconnect / demo mode, device info (MG vs 5.0, firmware, battery, worn), fast-sync and profile settings, connection log |
 
 **Demo mode** simulates a WHOOP MG (heartbeat with HRV, wrist tremor, pulse wave and lie reactions). Its
 data is encoded into real WHOOP frames and goes through the same parser, so the whole app works in the
@@ -48,8 +49,35 @@ Hello:  AA 01 08 00 00 01 E6 71 23 01 91 01 36 3E 5C 8D
 4. Raw IMU: `START_RAW_DATA [01]`, then `TOGGLE_IMU_MODE [01 01]` → 0x2B / layout 21 (1,244 bytes).
    Each record holds 100 samples of accel and gyro: ±8 g at 1/4096 g per LSB, and 2000 °/s full scale.
 
-The app never offloads or acknowledges history. Acknowledging history lets the strap delete records the
-official app has not synced yet. Firmware, pairing-reset, trim and reboot commands are never sent.
+The app never acknowledges history (HISTORICAL_DATA_RESULT, 23). Acknowledging history lets the strap delete
+records the official app has not synced yet. Firmware, pairing-reset, trim, read-pointer and reboot commands
+are never sent.
+
+### Skin temperature (and steps, activity, strap state)
+
+The firmware has no command that returns the temperature. The AS6221 reading lands only in the strap's
+stored **one-second summary** (history layout 18, a 124-byte frame). It holds skin °C×100 at offset 73, two
+auxiliary thermal channels (°C×10) at 69/71, the hardware step counter at 57, the activity class at 63 and the
+motion/rest state in byte 81. The decoder is pinned against a real WHOOP 5 capture (32.18 °C). The app reads
+these records in three ways, none of which can lose data:
+
+* **Passive.** When the official WHOOP app on the same iPhone syncs, the records stream over the shared
+  Bluetooth link. iOS delivers notifications to every subscribed app, so MX Whoop sees them too.
+* **Fast sync.** `ENTER_HIGH_FREQ_SYNC [02, 61 s, 1800 s]` makes the strap raise event 96 every minute. The
+  official app answers that event with a sync (decompiled app: *"Triggering 1 minute sync based on the High
+  Freq Sync Prompt"*). That app stores and acknowledges as usual. MX Whoop only enables this while it's on
+  screen, and only ends sessions it started itself.
+* **Peek.** `GET_DATA_RANGE` plus `SEND_HISTORICAL_DATA` *without ever acknowledging*, then
+  `ABORT_HISTORICAL_TRANSMITS`. The strap shows the first chunk after the last sync and keeps everything.
+  Its next attempt restarts from the acknowledged position.
+
+### ECG (WHOOP MG, experimental)
+
+`SELECT_WRIST [01, 01 right / 02 left]` → `TOGGLE_LABRADOR_FILTERED [01, 01]` → `TOGGLE_LABRADOR_DATA_GENERATION
+[01, 02]`. These payloads come from the official app's builders. Filtered ECG then arrives as packet 43 / layout 17
+(240 bytes, up to 100 i16 samples). To stop: generation `[01, 01]`, then filtered `[01, 00]`. The app never resends
+START on reconnect. If it was closed mid-recording, the next connection sends the stop sequence. The sample rate
+isn't documented, so it's estimated from arrival times.
 
 **If pairing is refused:** the strap is probably bonded to another phone. Tap the strap until the LED
 flashes blue (pairing mode) and connect again. If iOS remembers a stale pairing, forget the strap in

@@ -12,11 +12,21 @@ public enum WhoopParser {
         switch PacketType(rawValue: type) {
         case .realtimeData:
             if let hr = realtimeHR(b, end: end) { return .realtimeHR(hr) }
-        case .realtimeRawData, .historicalData:
+        case .realtimeRawData:
             switch layout {
             case 21: if let imu = imuR21(b, end: end) { return .imu(imu) }
             case 26: if let o = opticalR26(b, end: end) { return .optical(o) }
             case 20: if let o = opticalR20(b, end: end) { return .optical(o) }
+            case 16, 17: if let e = ecg(b, live: true) { return .ecg(e) }
+            default: break
+            }
+        case .historicalData:
+            // Stored records replayed by a sync, usually the official app's. Old IMU and
+            // optical windows must never be mixed into the live timeline, so only the
+            // one-second summary (and ECG, flagged as not live) is decoded.
+            switch layout {
+            case 18: if let r = biometricR18(b) { return .biometric(r) }
+            case 16, 17: if let e = ecg(b, live: false) { return .ecg(e) }
             default: break
             }
         case .commandResponse, .puffinCommandResponse:
@@ -110,7 +120,87 @@ public enum WhoopParser {
         return nil
     }
 
+    // MARK: Layout 18 — one-second biometric summary (124-byte frame, history only)
+
+    /// `[11] u32 index · [15] u32 unix s · [22] bpm · [23] rr count · [24+2i] rr ticks ·
+    /// [36] quality · [41] f32 dynamic g · [45/49/53] f32 gravity · [57] u16 steps ·
+    /// [63] activity · [69/71] i16 aux °C×10 · [73] u16 skin °C×100 · [81] state bits`.
+    static func biometricR18(_ b: [UInt8]) -> BiometricRecord? {
+        // A record of another size is a different layout, not this one with fields missing.
+        guard b.count == 124 else { return nil }
+        let count = min(Int(b[23]), 4)
+        var rr: [Double] = []
+        for i in 0..<count {
+            let ticks = Int(b.u16(at: 24 + 2 * i))
+            if ticks > 0 { rr.append(Double((ticks * 1000 + 512) / 1024)) }
+        }
+        let skin = Double(b.u16(at: 73)) / 100
+        let aux1 = Double(b.i16(at: 69)) / 10
+        let aux2 = Double(b.i16(at: 71)) / 10
+        let dynamic = Double(b.f32(at: 41))
+        let gx = b.f32(at: 45), gy = b.f32(at: 49), gz = b.f32(at: 53)
+        let gravityValid = gx.isFinite && gy.isFinite && gz.isFinite
+        return BiometricRecord(
+            recordIndex: b.u32(at: 11), unixTime: b.u32(at: 15), bpm: Int(b[22]), rrIntervalsMs: rr,
+            skinTempC: (5...45).contains(skin) ? skin : nil,
+            auxTemp1C: (0...60).contains(aux1) ? aux1 : nil,
+            auxTemp2C: (0...60).contains(aux2) ? aux2 : nil,
+            dynamicAccelG: dynamic.isFinite && (0...8).contains(dynamic) ? dynamic : nil,
+            gravity: gravityValid ? SIMD3(gx, gy, gz) : nil,
+            steps: b.u16(at: 57),
+            activity: BiometricRecord.Activity(rawValue: b[63]),
+            bandState: BiometricRecord.BandState(rawValue: (b[81] >> 4) & 3) ?? .wake,
+            qualityFlags: b[36])
+    }
+
+    // MARK: Layouts 16/17 — MG ECG
+
+    /// Shared header: `[11] u32 sequence · [21] quality · [22] state bits · [23] classifier result ·
+    /// [24] classifier state · [25] progress · [27] HR value · [32] u16 sample count`.
+    /// R17 (240 B): 100 i16 slots from 34. R16 (1,584 B): 500 three-byte slots from 34, an
+    /// 18-bit two's-complement value in the low bits (bits 6–7 of the first byte are flags).
+    static func ecg(_ b: [UInt8], live: Bool) -> ECGRecord? {
+        let layout = b[9]
+        let filtered = layout == 17
+        let (size, capacity, width) = filtered ? (240, 100, 2) : (1584, 500, 3)
+        guard b.count == size else { return nil }
+        let declared = Int(b.u16(at: 32))
+        // A count above the fixed capacity is an anomaly, not something to truncate.
+        guard declared <= capacity else { return nil }
+        var samples: [Int32] = []
+        samples.reserveCapacity(declared)
+        for i in 0..<declared {
+            let o = 34 + i * width
+            if filtered {
+                samples.append(Int32(b.i16(at: o)))
+            } else {
+                let raw = Int32(b[o] & 0x03) << 16 | Int32(b[o + 1]) << 8 | Int32(b[o + 2])
+                samples.append(raw >= 131_072 ? raw - 262_144 : raw)
+            }
+        }
+        return ECGRecord(layout: layout, isLive: live, sequence: b.u32(at: 11), quality: b[21],
+                         statusBits: b[22], classifierResult: b[23], classifierState: b[24],
+                         progress: b[25], strapHRValue: b[27], samples: samples)
+    }
+
     // MARK: Command response bodies
+
+    /// GET_DATA_RANGE final body: revision 1 then u32 fields — read page at 5, write page at
+    /// 9, trim page at 13, capacity at 21, record estimate at 25, and clock pairs for the
+    /// trim-side page at 41 and the last-written page at 57 (noop `PROTOCOL_TRANSPORT.md`).
+    public static func dataRange(_ r: CommandResponse) -> DataRange? {
+        guard r.command == WhoopCommand.getDataRange.rawValue, r.result == .success, r.body.count >= 65,
+              r.body[0] == 1 else { return nil }
+        let b = r.body
+        // Failed page reads come back as all-ones; anything outside 2020–2100 is not a time.
+        func clock(_ offset: Int) -> UInt32? {
+            let v = b.u32(at: offset)
+            return (1_577_836_800...4_102_444_800).contains(v) ? v : nil
+        }
+        return DataRange(readPage: b.u32(at: 5), writePage: b.u32(at: 9), trimPage: b.u32(at: 13),
+                         capacity: b.u32(at: 21), recordEstimate: b.u32(at: 25),
+                         oldestUnsyncedTime: clock(41), newestTime: clock(57))
+    }
 
     /// GET_HELLO final body (107 or 111 bytes). Returns nil for the zero-filled PENDING reply.
     public static func hello(_ r: CommandResponse) -> HelloInfo? {

@@ -20,6 +20,8 @@ final class Recorder {
         "imu.csv": "unix_time,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps",
         "optical.csv": "unix_time,raw",
         "events.csv": "unix_time,event",
+        "strap_summary.csv": "measured_unix_time,record_index,skin_temp_c,aux1_c,aux2_c,bpm,steps_counter,activity,band_state,source",
+        "ecg.csv": "unix_time,ecg_native",
         "frames.log": "unix_time channel hex",
     ]
 
@@ -89,6 +91,23 @@ final class Recorder {
             String(format: "%.3f,%.0f", end - Double(samples.count - 1 - i) * step, v)
         }.joined(separator: "\n")
         append("optical.csv", lines + "\n")
+    }
+
+    /// One stored one-second summary, stamped with the strap's measurement time.
+    func biometric(_ r: BiometricRecord, source: String) {
+        func c(_ v: Double?) -> String { v.map { String(format: "%.2f", $0) } ?? "" }
+        let activity = r.activity.map { "\($0)" } ?? ""
+        write("strap_summary.csv",
+              "\(r.unixTime),\(r.recordIndex),\(c(r.skinTempC)),\(c(r.auxTemp1C)),\(c(r.auxTemp2C)),\(r.bpm),\(r.steps),\(activity),\(r.bandState),\(source)")
+    }
+
+    func ecg(_ samples: [Double], sampleRate: Double) {
+        guard isRecording, !samples.isEmpty, sampleRate > 0 else { return }
+        let end = Date().timeIntervalSince1970
+        let lines = samples.enumerated().map { i, v in
+            String(format: "%.4f,%.0f", end - Double(samples.count - 1 - i) / sampleRate, v)
+        }.joined(separator: "\n")
+        append("ecg.csv", lines + "\n")
     }
 
     func log(frame: WhoopFrame, channel: String) {

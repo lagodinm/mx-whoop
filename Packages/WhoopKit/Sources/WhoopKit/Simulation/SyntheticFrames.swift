@@ -84,6 +84,72 @@ public enum SyntheticFrames {
         return frame(body: b)
     }
 
+    /// Layout 18 one-second summary (124-byte frame), as replayed during a history sync.
+    public static func biometricR18(index: UInt32, time: UInt32, bpm: Int, rrMs: [Double], skinTempC: Double,
+                                    auxTempC: (Double, Double) = (29.4, 30.7), steps: UInt16 = 0,
+                                    activity: UInt8 = 0, bandState: UInt8 = 0,
+                                    gravity: SIMD3<Float> = SIMD3(0.05, -0.30, 0.95),
+                                    dynamicAccelG: Float = 0.02) -> WhoopFrame {
+        var b = [UInt8](repeating: 0, count: 124 - 12)
+        func put(_ bytes: [UInt8], at frameOffset: Int) {
+            for (i, x) in bytes.enumerated() { b[frameOffset - 8 + i] = x }
+        }
+        func f32(_ v: Float) -> [UInt8] { v.bitPattern.littleEndianBytes }
+        func i16(_ v: Double) -> [UInt8] { UInt16(bitPattern: Int16(clamping: Int(v.rounded()))).littleEndianBytes }
+        let rr = rrMs.suffix(4)
+        put([PacketType.historicalData.rawValue, 18, 0x80], at: 8)
+        put(index.littleEndianBytes, at: 11)
+        put(time.littleEndianBytes, at: 15)
+        put([UInt8(clamping: bpm), UInt8(rr.count)], at: 22)
+        for (i, x) in rr.enumerated() { put(UInt16(clamping: Int((x * 1024 / 1000).rounded())).littleEndianBytes, at: 24 + 2 * i) }
+        put([0x8C], at: 36)
+        put(f32(dynamicAccelG), at: 41)
+        put(f32(gravity.x) + f32(gravity.y) + f32(gravity.z), at: 45)
+        put(steps.littleEndianBytes, at: 57)
+        put([activity], at: 63)
+        put(i16(auxTempC.0 * 10) + i16(auxTempC.1 * 10), at: 69)
+        put(UInt16(clamping: Int((skinTempC * 100).rounded())).littleEndianBytes, at: 73)
+        put([(bandState & 3) << 4], at: 81)
+        return frame(body: b)
+    }
+
+    /// Layout 17 filtered ECG (240-byte frame): up to 100 i16 samples from 34.
+    public static func ecgR17(sequence: UInt32, time: UInt32, samples: [Int16], quality: UInt8 = 3,
+                              presence: Bool = true, progress: UInt8 = 0, hr: UInt8 = 0,
+                              packetType: PacketType = .realtimeRawData) -> WhoopFrame {
+        var b = [UInt8](repeating: 0, count: 240 - 12)
+        func put(_ bytes: [UInt8], at frameOffset: Int) {
+            for (i, x) in bytes.enumerated() { b[frameOffset - 8 + i] = x }
+        }
+        let s = samples.prefix(100)
+        put([packetType.rawValue, 17, 0x00], at: 8)
+        put(sequence.littleEndianBytes, at: 11)
+        put(time.littleEndianBytes, at: 15)
+        put([quality, presence ? 0x08 : 0x00, 0, presence ? 1 : 0, progress, 0, hr], at: 21)
+        put(UInt16(s.count).littleEndianBytes, at: 32)
+        for (i, v) in s.enumerated() { put(UInt16(bitPattern: v).littleEndianBytes, at: 34 + 2 * i) }
+        return frame(body: b)
+    }
+
+    /// History stream marker (packet 49): START, END (carrying its 8-byte token) or COMPLETE.
+    public static func historyMarker(_ marker: HistoryMarker, time: UInt32, trimCursor: UInt32 = 0,
+                                     seq: UInt8 = 1) -> WhoopFrame {
+        var body: [UInt8] = [PacketType.metadata.rawValue, seq, marker.rawValue]
+        body += time.littleEndianBytes
+        body += [0, 0, 0, 0, 0, 0]
+        body += trimCursor.littleEndianBytes + [0, 0, 0, 0]
+        return frame(body: body)
+    }
+
+    /// GET_DATA_RANGE success body (revision 1 + sixteen u32 fields).
+    public static func dataRangeBody(read: UInt32, write: UInt32, trim: UInt32, capacity: UInt32 = 131_072,
+                                     estimate: UInt32, oldest: UInt32, newest: UInt32) -> [UInt8] {
+        var fields = [UInt32](repeating: 0, count: 16)
+        fields[1] = read; fields[2] = write; fields[3] = trim; fields[5] = capacity; fields[6] = estimate
+        fields[10] = oldest; fields[12] = oldest; fields[14] = newest
+        return [0x01] + fields.flatMap(\.littleEndianBytes)
+    }
+
     public static func event(_ number: UInt8, time: UInt32) -> WhoopFrame {
         frame(body: [PacketType.event.rawValue, 0x00, number, 0x00] + time.littleEndianBytes)
     }

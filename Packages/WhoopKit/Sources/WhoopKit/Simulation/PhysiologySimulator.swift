@@ -68,6 +68,14 @@ public struct PhysiologySimulator: Sendable {
         }
     }
 
+    /// Wrist skin temperature, °C: a slow drift around ~33 °C. Deterministic (uses no
+    /// random numbers), so it doesn't change the rest of the simulation.
+    public func skinTemperature(at t: Double) -> Double {
+        let slow: Double = 0.25 * sin(2 * Double.pi * t / 1500)
+        let ripple: Double = 0.04 * sin(2 * Double.pi * t / 97)
+        return 33.05 + slow + ripple
+    }
+
     private func isSpeaking(at t: Double) -> Bool {
         stimuli.contains { t - $0.t > 0.3 && t - $0.t < 3.5 }
     }

@@ -11,7 +11,9 @@ struct AccelPoint: Identifiable {
 
 /// One line of the Raw tab.
 struct RawEntry: Identifiable {
-    enum Kind: String, CaseIterable { case hr = "HR", imu = "IMU", event = "Events", command = "Cmd", other = "Other" }
+    enum Kind: String, CaseIterable {
+        case hr = "HR", imu = "IMU", body = "Body", event = "Evt", command = "Cmd", other = "Other"
+    }
     let id: Int
     let date: Date
     let channel: String
@@ -56,6 +58,23 @@ final class SensorHub {
     private(set) var accelPreview: [AccelPoint] = []
     private(set) var opticalPreview: [Double] = []
     private(set) var timeline = PhysioTimeline()
+    private(set) var stressIndex: Double?
+    private(set) var frequencyHRV: FrequencyHRV?
+
+    // Effort (session totals since connect)
+    var profile: EffortProfile = SensorHub.loadProfile() {
+        didSet { UserDefaults.standard.set(try? JSONEncoder().encode(profile), forKey: Self.profileKey) }
+    }
+    private(set) var zone: Int?
+    private(set) var percentOfMax: Double?
+    private(set) var restingHR: Double?
+    private(set) var sessionKcal: Double = 0
+    private(set) var sessionStrain: Double = 0
+
+    /// Skin temperature, steps and strap state from the strap's stored summary records.
+    let biometrics = BiometricsMonitor()
+    /// Experimental live ECG (WHOOP MG).
+    let ecg = ECGSession()
 
     // Streams & settings
     private(set) var imuEnabled = false
@@ -86,13 +105,31 @@ final class SensorHub {
     @ObservationIgnored private var lastRealtimeArm: Double = 0
     @ObservationIgnored private var rawCounter = 0
     @ObservationIgnored private var accelCounter = 0
+    @ObservationIgnored private var tickCount = 0
+    @ObservationIgnored private var sessionTrimp = 0.0
 
     static let timelineSpan: Double = 15 * 60
     static let rawLogLimit = 400
+    private static let profileKey = "effortProfile"
 
     init() {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        biometrics.send = { [weak self] in self?.send($0) }
+        biometrics.log = { [weak self] in self?.addLog($0) }
+        biometrics.recorder = recorder
+        ecg.send = { [weak self] in self?.send($0) }
+        ecg.log = { [weak self] in self?.addLog($0) }
+        ecg.recorder = recorder
     }
+
+    private static func loadProfile() -> EffortProfile {
+        guard let data = UserDefaults.standard.data(forKey: profileKey),
+              let p = try? JSONDecoder().decode(EffortProfile.self, from: data) else { return EffortProfile() }
+        return p
+    }
+
+    /// Foreground/background: fast sync only runs while the app is on screen.
+    func setAppActive(_ active: Bool) { biometrics.setAppActive(active) }
 
     var now: Double { Date().timeIntervalSinceReferenceDate }
 
@@ -117,6 +154,8 @@ final class SensorHub {
 
     func disconnect() {
         if linkState == .streaming {
+            ecg.stop()
+            biometrics.willDisconnect()
             if imuEnabled || opticalEnabled { send(CommandBody.rawData(false)) }
             if imuEnabled { send(CommandBody.imuStream(false)) }
             if opticalEnabled { send(CommandBody.opticalStream(false)) }
@@ -133,7 +172,10 @@ final class SensorHub {
         self.source = source
         deviceInfo = [:]; firmware = nil; battery = nil; onWrist = nil; deviceName = nil
         heartRate = nil; hrv = nil; motion = nil; accelPreview = []; opticalPreview = []
+        stressIndex = nil; frequencyHRV = nil
         timeline = PhysioTimeline()
+        resetEffort()
+        biometrics.reset()
         newLink.onEvent = { [weak self] event in self?.handle(event) }
     }
 
@@ -181,6 +223,10 @@ final class SensorHub {
             linkState = s
             if s != previous { addLog(s.label) }
             if s == .streaming && previous != .streaming { sessionStarted() }
+            if previous == .streaming && s != .streaming {
+                biometrics.linkLost()
+                ecg.linkLost()
+            }
             if !s.isConnected { heartRate = nil }
         case .frame(let f, let ch):
             handleFrame(f, channel: ch)
@@ -214,6 +260,8 @@ final class SensorHub {
         lastWhoopHRAt = now // give the stream a grace period before the watchdog re-arms
         if imuEnabled { send(CommandBody.rawData(true)); send(CommandBody.imuStream(true)) }
         if opticalEnabled { send(CommandBody.rawData(true)); send(CommandBody.opticalStream(true)) }
+        ecg.sessionStarted()
+        biometrics.sessionStarted()
     }
 
     private func handleFrame(_ f: WhoopFrame, channel: LinkChannel) {
@@ -233,18 +281,29 @@ final class SensorHub {
             ingestIMU(batch)
         case .optical(let window):
             ingestOptical(window)
+        case .biometric(let record):
+            biometrics.ingest(record)
+        case .ecg(let record):
+            ecg.ingest(record)
         case .commandResponse(let r):
             if let hello = WhoopParser.hello(r) {
                 firmware = hello.firmware
                 if hello.batteryPercent > 0 { battery = Int(hello.batteryPercent.rounded()) }
             }
             if let b = WhoopParser.batteryPercent(r) { battery = b }
+            biometrics.handleResponse(r)
+            ecg.handle(r)
         case .event(let e):
             lastEvent = e
             if e.number == StrapEvent.wristOn { onWrist = true }
             if e.number == StrapEvent.wristOff { onWrist = false }
+            biometrics.handleEvent(e)
             recorder.event(e.name)
-        case .consoleLog, .metadata, .other:
+        case .metadata(let type, let kind):
+            if type == PacketType.metadata.rawValue || type == PacketType.puffinMetadata.rawValue {
+                biometrics.handleMarker(kind)
+            }
+        case .consoleLog, .other:
             break
         }
         addRaw(channel: channel.rawValue, title: title, summary: summary, bytes: f.bytes,
@@ -305,14 +364,22 @@ final class SensorHub {
     /// Once per second: trim history, recompute HRV / breathing / arousal, run the watchdog.
     private func tick() {
         let t = now
+        tickCount += 1
         timeline.trim(before: t - Self.timelineSpan)
         if !timeline.beats.isEmpty {
             hrv = HRV.metrics(timeline.beats.values(from: t - 60, to: t + 1))
             respirationRate = HRV.respirationRate(Array(timeline.beats.slice(from: t - 64, to: t + 1)))
+            stressIndex = HRV.stressIndex(timeline.beats.values(from: t - 120, to: t + 1))
+            if tickCount % 5 == 0 {
+                frequencyHRV = HRV.frequencyDomain(Array(timeline.beats.slice(from: t - 180, to: t + 1)))
+            }
         } else {
-            hrv = nil; respirationRate = nil
+            hrv = nil; respirationRate = nil; stressIndex = nil; frequencyHRV = nil
         }
         arousal = LieDetector.liveArousal(timeline, now: t, noise: noiseProfile)
+        updateEffort(t)
+        biometrics.tick()
+        ecg.tick()
         if heartRate != nil, t - lastHRAt > 5 { heartRate = nil }
         // Live HR stopped (e.g. the WHOOP app turned it off): re-arm, at most every 10 s.
         if linkState == .streaming, t - lastWhoopHRAt > 10, t - lastRealtimeArm > 10 {
@@ -320,6 +387,29 @@ final class SensorHub {
             addLog("No live HR for 10 s — re-arming TOGGLE_REALTIME_HR")
             send(CommandBody.realtimeHR(true))
         }
+    }
+
+    // MARK: Effort
+
+    private func updateEffort(_ t: Double) {
+        // Resting HR: the lowest one-minute mean seen this session.
+        let lastMinute = timeline.heartRate.values(from: t - 60, to: t + 1)
+        if lastMinute.count >= 45, let m = Stats.mean(lastMinute) { restingHR = min(restingHR ?? m, m) }
+        guard hasLiveHeartRate, let bpm = heartRate else {
+            zone = nil; percentOfMax = nil
+            return
+        }
+        let hr = Double(bpm)
+        zone = Effort.zone(hr: hr, maxHR: profile.maxHR)
+        percentOfMax = 100 * hr / profile.maxHR
+        sessionKcal += Effort.kcalPerMinute(hr: hr, profile: profile) / 60
+        sessionTrimp += Effort.trimp(hr: hr, restingHR: restingHR ?? 60, profile: profile, seconds: 1)
+        sessionStrain = Effort.strain(trimp: sessionTrimp)
+    }
+
+    private func resetEffort() {
+        zone = nil; percentOfMax = nil; restingHR = nil
+        sessionKcal = 0; sessionStrain = 0; sessionTrimp = 0
     }
 
     // MARK: Raw log
@@ -358,6 +448,13 @@ final class SensorHub {
             return ("R21 IMU", "\(b.accel.count) acc + \(b.gyro.count) gyro · \(g)", .imu)
         case .optical(let o):
             return ("R\(o.layout) OPTICAL", "\(o.samples.count) samples", .imu)
+        case .biometric(let r):
+            let temp = r.skinTempC.map { String(format: "%.2f °C", $0) } ?? "no temp"
+            let at = Date(timeIntervalSince1970: TimeInterval(r.unixTime)).formatted(date: .omitted, time: .standard)
+            return ("R18 SUMMARY", "#\(r.recordIndex) at \(at) · \(temp) · HR \(r.bpm) · steps \(r.steps)", .body)
+        case .ecg(let e):
+            let source = e.isLive ? "live" : "history"
+            return ("R\(e.layout) ECG", "\(e.samples.count) samples (\(source)) · quality \(e.quality) · progress \(e.progress)", .body)
         case .commandResponse(let r):
             let result = r.result.map { "\($0)".uppercased() } ?? "result \(r.resultRaw)"
             return ("RESPONSE", "\(r.commandName) #\(r.originSeq) · \(result) · \(r.body.count) B", .command)
@@ -366,10 +463,10 @@ final class SensorHub {
         case .consoleLog(let text):
             return ("CONSOLE", String(text.prefix(120)), .other)
         case .metadata(_, let kind):
-            return ("METADATA", "\(typeName) kind \(kind)", .other)
-        case .other(let type, let layout):
-            let note = (layout == 16 || layout == 17) && type == PacketType.realtimeRawData.rawValue ? " (ECG)" : ""
-            return (typeName, "layout \(layout)\(note) · \(f.count) B", .other)
+            let marker = HistoryMarker(rawValue: kind).map { "HISTORY_\("\($0)".uppercased())" } ?? "kind \(kind)"
+            return ("METADATA", "\(typeName) \(marker)", .body)
+        case .other(_, let layout):
+            return (typeName, "layout \(layout) · \(f.count) B", .other)
         }
     }
 }

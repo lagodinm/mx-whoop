@@ -10,9 +10,11 @@ struct LiveView: View {
                 VStack(spacing: 14) {
                     if !hub.linkState.isConnected { ConnectCard() }
                     HeartHero()
+                    SkinTempCard()
                     Card("Heart rate · 5 min", systemImage: "heart.fill") {
                         HeartRateChart(samples: hub.timeline.heartRate)
                     }
+                    EffortCard()
                     variabilityCard
                     motionCard
                     opticalCard
@@ -39,8 +41,17 @@ struct LiveView: View {
                            footnote: "from sinus arrhythmia")
                 MetricTile(title: "Last R-R", value: fmt(hub.lastRR), unit: "ms")
                 MetricTile(title: "Mean HR (R-R)", value: fmt(hub.hrv?.meanHR), unit: "bpm")
+                MetricTile(title: "Stress index", value: fmt(hub.stressIndex), color: stressColor,
+                           footnote: "Baevsky, 2 min · rest 50–150")
+                MetricTile(title: "LF/HF", value: fmt(hub.frequencyHRV.map(\.lfhf), digits: 2),
+                           footnote: hub.frequencyHRV.map { "LF \(Int($0.lf)) · HF \(Int($0.hf)) ms²" } ?? "needs ~2 min of beats")
             }
         }
+    }
+
+    private var stressColor: Color {
+        guard let si = hub.stressIndex else { return .white }
+        return si > 500 ? Theme.lie : si > 150 ? Theme.warning : Theme.truth
     }
 
     private var motionCard: some View {

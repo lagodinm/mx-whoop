@@ -44,24 +44,33 @@ public enum PacketType: UInt8, CaseIterable, Sendable {
 /// Command numbers at frame offset 10 (WHOOP 5.0 / MG, firmware 50.4x).
 ///
 /// Only commands this app actually sends, plus a few useful for labelling
-/// responses. History offload (22/23) is intentionally absent: acknowledging
-/// history chunks lets the strap trim data the official WHOOP app has not yet
-/// synced. Destructive commands (FORGET_BONDS 15, FORCE_TRIM 25, REBOOT 29,
+/// responses. The history acknowledgement (HISTORICAL_DATA_RESULT, 23) is
+/// intentionally absent: acknowledging a chunk lets the strap trim data the
+/// official WHOOP app has not synced yet. Without it a history request is a
+/// read-only peek, and the next sync starts from the same place. Destructive
+/// commands (FORGET_BONDS 15, FORCE_TRIM 25, REBOOT 29, SET_READ_POINTER 33,
 /// firmware/certificate 142–159) are never sent.
 public enum WhoopCommand: UInt8, Sendable {
     case linkValid = 1
     case toggleRealtimeHR = 3
     case runHapticPatternMaverick = 19     // 0x13: the buzz opcode on 5/MG
+    case abortHistoricalTransmits = 20
+    case sendHistoricalData = 22
     case getBatteryLevel = 26
     case getDataRange = 34
     case startRawData = 81
     case stopRawData = 82
     case getBodyLocationAndStatus = 84
+    case enterHighFreqSync = 96
+    case exitHighFreqSync = 97
     case toggleIMUModeHistorical = 105
     case toggleIMUMode = 106              // live IMU transport
     case enableOpticalData = 107          // optical *session saving* on 5/MG
     case toggleOpticalMode = 108          // live optical transport
     case stopHaptics = 122
+    case selectWrist = 123                // MG ECG
+    case toggleECGGeneration = 124        // TOGGLE_LABRADOR_DATA_GENERATION
+    case toggleECGFiltered = 139          // TOGGLE_LABRADOR_FILTERED (live output)
     case getHello = 145
     case setClock = 146
     case getClock = 147
@@ -139,6 +148,68 @@ public enum CommandBody {
     public static let getClock = Request(command: WhoopCommand.getClock.rawValue, params: [0x01], label: "GET_CLOCK")
     public static let getBattery = Request(command: WhoopCommand.getBatteryLevel.rawValue, params: [0x00], label: "GET_BATTERY_LEVEL")
     public static let bodyLocation = Request(command: WhoopCommand.getBodyLocationAndStatus.rawValue, params: [0x01], label: "GET_BODY_LOCATION")
+
+    // MARK: History (read-only)
+
+    /// GET_DATA_RANGE `00`: history ring positions and page clocks. Read-only; the official
+    /// app sends exactly this before every sync.
+    public static let dataRange = Request(command: WhoopCommand.getDataRange.rawValue, params: [0x00], label: "GET_DATA_RANGE")
+
+    /// SEND_HISTORICAL_DATA `00`. The strap streams START, the first stored chunk after the
+    /// last acknowledged position, then END and waits for HISTORICAL_DATA_RESULT. This app
+    /// never sends that acknowledgement, so nothing is released: it is a peek, and the
+    /// official app's next sync starts from the same record.
+    public static let sendHistory = Request(command: WhoopCommand.sendHistoricalData.rawValue, params: [0x00],
+                                            label: "SEND_HISTORICAL_DATA (peek)")
+
+    /// ABORT_HISTORICAL_TRANSMITS `00`: ends an open history attempt. A stop request, not a trim.
+    public static let abortHistory = Request(command: WhoopCommand.abortHistoricalTransmits.rawValue, params: [0x00],
+                                             label: "ABORT_HISTORICAL_TRANSMITS")
+
+    // MARK: High-frequency sync
+
+    /// ENTER_HIGH_FREQ_SYNC revision 2: `[2][interval u16][duration u16]`, seconds, with
+    /// interval > 60 and duration < 28 800 (byte layout from the official app's builder).
+    /// The strap then raises event 96 every interval; the official app answers each one
+    /// with a sync ("Triggering 1 minute sync based on the High Freq Sync Prompt"). The
+    /// session expires on its own after `duration`.
+    public static func enterHighFreqSync(interval: Int = 61, duration: Int = 1800) -> Request {
+        let i = UInt16(min(max(interval, 61), 65_535))
+        let d = UInt16(min(max(duration, 0), 28_799))
+        return Request(command: WhoopCommand.enterHighFreqSync.rawValue,
+                       params: [0x02] + i.littleEndianBytes + d.littleEndianBytes,
+                       label: "ENTER_HIGH_FREQ_SYNC \(i) s")
+    }
+
+    public static let exitHighFreqSync = Request(command: WhoopCommand.exitHighFreqSync.rawValue, params: [0x00],
+                                                 label: "EXIT_HIGH_FREQ_SYNC")
+
+    // MARK: MG ECG
+
+    /// Wrist codes from the official app: RIGHT = 1, LEFT = 2.
+    public enum Wrist: UInt8, CaseIterable, Sendable {
+        case right = 1, left = 2
+        public var name: String { self == .left ? "Left" : "Right" }
+    }
+
+    /// SELECT_WRIST (123) revision 1. Must be accepted before ECG generation starts.
+    public static func selectWrist(_ wrist: Wrist) -> Request {
+        Request(command: WhoopCommand.selectWrist.rawValue, params: [0x01, wrist.rawValue],
+                label: "SELECT_WRIST \(wrist.name.lowercased())")
+    }
+
+    /// TOGGLE_LABRADOR_DATA_GENERATION (124) revision 1: STOP = 1, START = 2.
+    /// Not idempotent: never resend START while a session may be running.
+    public static func ecgGeneration(_ on: Bool) -> Request {
+        Request(command: WhoopCommand.toggleECGGeneration.rawValue, params: [0x01, on ? 2 : 1],
+                label: "ECG_GENERATION \(on ? "start" : "stop")")
+    }
+
+    /// TOGGLE_LABRADOR_FILTERED (139) revision 1: live filtered ECG output, DISABLE = 0, ENABLE = 1.
+    public static func ecgLiveFiltered(_ on: Bool) -> Request {
+        Request(command: WhoopCommand.toggleECGFiltered.rawValue, params: [0x01, on ? 1 : 0],
+                label: "ECG_LIVE_FILTERED \(on ? "on" : "off")")
+    }
 }
 
 extension UInt32 {

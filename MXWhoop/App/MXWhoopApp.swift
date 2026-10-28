@@ -23,16 +23,25 @@ struct MXWhoopApp: App {
 }
 
 struct RootView: View {
+    @Environment(SensorHub.self) private var hub
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         TabView {
             LiveView()
-                .tabItem { Label("Live", systemImage: "waveform.path.ecg") }
+                .tabItem { Label("Live", systemImage: "heart.text.square") }
             LieDetectorView()
                 .tabItem { Label("Lie Detector", systemImage: "questionmark.bubble") }
+            ECGView()
+                .tabItem { Label("ECG", systemImage: "waveform.path.ecg") }
             RawView()
                 .tabItem { Label("Raw", systemImage: "chevron.left.forwardslash.chevron.right") }
             StrapView()
                 .tabItem { Label("Strap", systemImage: "sensor.tag.radiowaves.forward") }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // .inactive (Control Center, app switcher) is brief; only real backgrounding counts.
+            hub.setAppActive(phase != .background)
         }
     }
 }
